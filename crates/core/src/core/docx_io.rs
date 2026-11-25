@@ -19,20 +19,79 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use zip::ZipArchive;
 
-use crate::core::models::{Align, Paragraph};
+use crate::core::models::{Align, Paragraph, TextRun, TextRunStyle};
 
 /// 段落直接格式（来自 document.xml 的 `w:pPr`）。
-#[derive(Default)]
-struct ParaFmt {
-    style_id: Option<String>,
+#[derive(Default, Clone, Debug)]
+pub(crate) struct ParaFmt {
+    pub(crate) style_id: Option<String>,
     /// `w:jc` 对齐值（center/right/left/both/...）。
-    jc: Option<String>,
+    pub(crate) jc: Option<String>,
     /// `w:ind` 的 `w:firstLineChars`（1/100 字符）。
-    first_line_chars: Option<i32>,
+    pub(crate) first_line_chars: Option<i32>,
     /// `w:ind` 的 `w:firstLine`（twips，1/20 pt）。
-    first_line_twips: Option<i32>,
+    pub(crate) first_line_twips: Option<i32>,
     /// 段落首个 run 的 `w:rPr/w:sz`（半磅）。
-    run_sz_half_pt: Option<u32>,
+    pub(crate) run_sz_half_pt: Option<u32>,
+    /// 段落默认字体（来自 w:pPr）。
+    pub(crate) font_family: Option<String>,
+}
+
+/// 解析后的单个段落（直接格式 + 原始 Run 列表）。
+#[derive(Debug)]
+pub(crate) struct ParsedParagraph {
+    pub(crate) runs: Vec<TextRun>,
+    pub(crate) fmt: ParaFmt,
+}
+
+/// body 元素流：段落与表格按文档顺序交错（供表格识别使用）。
+#[derive(Debug)]
+pub(crate) enum BodyElement {
+    Paragraph(ParsedParagraph),
+    Table(ParsedTable),
+}
+
+/// 顶层表格解析结果（原始结构，未做标签拆分）。
+#[derive(Debug, Default)]
+pub(crate) struct ParsedTable {
+    /// tblGrid 列数（缺 tblGrid 时按首行 gridSpan 总和回填）。
+    pub(crate) grid_cols: usize,
+    pub(crate) rows: Vec<ParsedRow>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ParsedRow {
+    pub(crate) cells: Vec<ParsedCell>,
+}
+
+/// 单元格垂直合并状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum CellVMerge {
+    #[default]
+    None,
+    /// 合并起始格（内容在此格）。
+    Restart,
+    /// 合并续行格（无内容，但占用列）。
+    Continue,
+}
+
+/// 表格单元格（所有段落 runs 拼接，段落间以 "\n" run 分隔）。
+#[derive(Debug)]
+pub(crate) struct ParsedCell {
+    pub(crate) runs: Vec<TextRun>,
+    /// 首段直接格式（jc 用于对齐、run_sz_half_pt 用于字号回退）。
+    pub(crate) fmt: ParaFmt,
+    /// w:gridSpan 跨列数（默认 1）。
+    pub(crate) grid_span: usize,
+    pub(crate) v_merge: CellVMerge,
+    /// 起始列号（0 基，按行内前序单元格宽度累计推算）。
+    pub(crate) col_start: usize,
+}
+
+impl Default for ParsedCell {
+    fn default() -> Self {
+        Self { runs: Vec::new(), fmt: ParaFmt::default(), grid_span: 1, v_merge: CellVMerge::None, col_start: 0 }
+    }
 }
 
 /// 样式定义（来自 styles.xml 的 `w:style`）。
@@ -46,7 +105,7 @@ struct StyleDef {
     sz_half_pt: Option<u32>,
 }
 
-/// 从 docx 读取段落（忽略空段），对齐/首行缩进还原。
+/// 从 docx 读取段落（忽略空段），对齐/首行缩进还原，并提取 Run 级富文本样式与标签。
 pub fn load_paragraphs(path: &Path, font_size: f32) -> Result<Vec<Paragraph>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("读取 docx {path:?} 失败：{e}"))?;
     let mut archive =
@@ -55,21 +114,123 @@ pub fn load_paragraphs(path: &Path, font_size: f32) -> Result<Vec<Paragraph>, St
     let document_xml = read_entry(&mut archive, "word/document.xml")?;
     let styles_xml = read_entry_optional(&mut archive, "word/styles.xml");
 
-    let (texts, fmts) = parse_document(&document_xml)?;
+    let mut registry = StyleRegistry::new();
+    let parsed_stream = parse_body_stream(&document_xml, &mut registry)?;
+    let parsed_paras: Vec<ParsedParagraph> = parsed_stream
+        .into_iter()
+        .filter_map(|el| match el {
+            BodyElement::Paragraph(p) => Some(p),
+            BodyElement::Table(_) => None,
+        })
+        .collect();
     let (styles, doc_defaults_sz) = parse_styles(&styles_xml);
 
     let mut result = Vec::new();
-    for (text, fmt) in texts.into_iter().zip(fmts) {
-        if text.trim().is_empty() {
+    for parsed in parsed_paras {
+        // 展开标签语法（如 {{手写:内容}}）
+        let mut runs = Vec::new();
+        for r in parsed.runs {
+            runs.extend(split_syntax_tags(&r, &mut registry));
+        }
+
+        let (trimmed_text, trimmed_runs) = trim_paragraph_runs(runs);
+        if trimmed_text.is_empty() {
             continue;
         }
-        // 与 Python 版一致：存 `para.text.strip()` 后的文本
-        let text = text.trim().to_string();
-        let align = resolve_align(&fmt);
-        let indent = resolve_indent(&fmt, font_size, &styles, doc_defaults_sz);
-        result.push(Paragraph { text, align, first_line_indent: indent });
+
+        let align = resolve_align(&parsed.fmt);
+        let indent = resolve_indent(&parsed.fmt, font_size, &styles, doc_defaults_sz);
+        let p_font = trimmed_runs
+            .iter()
+            .find_map(|r| r.style.font_family.clone())
+            .or_else(|| parsed.fmt.font_family.clone());
+        result.push(Paragraph {
+            text: trimmed_text,
+            align,
+            first_line_indent: indent,
+            font_family: p_font,
+            runs: trimmed_runs,
+        });
     }
+
+    // 双模式自动分类：
+    // 如果整个文档没有任何高亮背景色：纯手写模式（未标记的普通文本为默认手写 role_id = 0）。
+    // 如果整个文档存在高亮背景色：高亮文本为手写（role_id >= 2, printed = false），所有未高亮文本自动转为印刷体模板（role_id = 1, printed = true）。
+    // 显式标签（{{打印:}}、{{1:}} 等）是用户明确指定的样式，不随纯手写模式重置而丢弃。
+    let has_highlights = result.iter().any(|p| {
+        p.runs
+            .iter()
+            .any(|r| r.style.highlight.is_some() || (r.style.role_id >= 2 && !r.style.printed))
+    });
+
+    if has_highlights {
+        for p in &mut result {
+            for r in &mut p.runs {
+                if r.style.role_id == 0 {
+                    r.style.role_id = 1;
+                    r.style.printed = true;
+                }
+            }
+        }
+    }
+
     Ok(result)
+}
+
+/// 探测文档的主字体名称（优先从印刷体或未高亮片段统计最常出现的字体族名）。
+pub fn detect_doc_font_family(paragraphs: &[Paragraph]) -> Option<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+
+    // 优先从印刷体或未高亮的 run 中提取
+    for p in paragraphs {
+        for r in &p.runs {
+            if r.style.printed || r.style.highlight.is_none() {
+                if let Some(ref font) = r.style.font_family {
+                    let trimmed = font.trim();
+                    if !trimmed.is_empty() {
+                        let count = counts.entry(trimmed.to_string()).or_insert(0);
+                        if *count == 0 {
+                            order.push(trimmed.to_string());
+                        }
+                        *count += r.text.chars().count().max(1);
+                    }
+                }
+            }
+        }
+    }
+
+    // 若无匹配，则回退统计所有 run
+    if counts.is_empty() {
+        for p in paragraphs {
+            for r in &p.runs {
+                if let Some(ref font) = r.style.font_family {
+                    let trimmed = font.trim();
+                    if !trimmed.is_empty() {
+                        let count = counts.entry(trimmed.to_string()).or_insert(0);
+                        if *count == 0 {
+                            order.push(trimmed.to_string());
+                        }
+                        *count += r.text.chars().count().max(1);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut best: Option<(String, usize)> = None;
+    for name in &order {
+        let count = counts.get(name).copied().unwrap_or(0);
+        if let Some((_, max_count)) = best {
+            if count > max_count {
+                best = Some((name.clone(), count));
+            }
+        } else {
+            best = Some((name.clone(), count));
+        }
+    }
+
+    best.map(|(name, _)| name)
 }
 
 /// 读取 zip 内指定 entry 的文本内容（UTF-8）。
@@ -99,88 +260,660 @@ fn local_name(name: &[u8]) -> &[u8] {
     }
 }
 
-/// 解析 document.xml，返回 (段落文本列表, 段落直接格式列表)。
-fn parse_document(xml: &str) -> Result<(Vec<String>, Vec<ParaFmt>), String> {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+/// 检查高亮颜色名称是否表示印刷体/灰色。
+pub fn is_gray_highlight(val: &str) -> bool {
+    let lower = val.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "lightgray"
+            | "light_gray"
+            | "light-gray"
+            | "darkgray"
+            | "dark_gray"
+            | "dark-gray"
+            | "gray-25"
+            | "gray25"
+            | "gray_25"
+            | "gray-50"
+            | "gray50"
+            | "gray_50"
+            | "gray"
+            | "grey"
+            | "lightgrey"
+            | "light_grey"
+            | "light-grey"
+            | "darkgrey"
+            | "dark_grey"
+            | "dark-grey"
+            | "grey-25"
+            | "grey25"
+            | "grey_25"
+            | "grey-50"
+            | "grey50"
+            | "grey_50"
+    )
+}
 
-    let mut texts = Vec::new();
-    let mut fmts = Vec::new();
-    // 状态
-    let mut in_body_para = false; // 当前 w:p 是 body 直接子级（对齐 python-docx doc.paragraphs）
-    let mut in_table = false;
+/// 动态样式与角色映射注册表。
+///
+/// 用于在解析 docx 时动态记录遇到的高亮颜色、文字颜色和标签样式，
+/// 按文档中首次出现的顺序依次分配角色 ID（Role 1 为 role_id=2, Role 2 为 role_id=3, ...）。
+/// 印刷体/灰色样式固定映射至 role_id=1。
+#[derive(Debug, Clone, Default)]
+pub struct StyleRegistry {
+    /// 样式键 -> 分配的 role_id。
+    entries: std::collections::HashMap<String, u32>,
+    /// 记录遇到的所有样式键（按首次出现顺序）。
+    ordered_keys: Vec<String>,
+    /// 下一个可分配的角色 ID（从 2 开始）。
+    next_role_id: u32,
+}
+
+impl StyleRegistry {
+    pub fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            ordered_keys: Vec::new(),
+            next_role_id: 2,
+        }
+    }
+
+    /// 获取或注册一个样式键，返回对应的 role_id。
+    pub fn get_or_register(&mut self, key: &str) -> u32 {
+        if let Some(&role_id) = self.entries.get(key) {
+            return role_id;
+        }
+        let role_id = self.next_role_id;
+        self.next_role_id += 1;
+        self.entries.insert(key.to_string(), role_id);
+        self.ordered_keys.push(key.to_string());
+        role_id
+    }
+
+    /// 检查指定样式键是否已注册。
+    pub fn get(&self, key: &str) -> Option<u32> {
+        self.entries.get(key).copied()
+    }
+
+    /// 获取按遇到顺序记录的样式键列表。
+    pub fn registered_keys(&self) -> &[String] {
+        &self.ordered_keys
+    }
+
+    /// 处理并应用高亮颜色到 TextRunStyle。
+    pub fn apply_highlight(&mut self, val: &str, style: &mut TextRunStyle) {
+        let trimmed = val.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "none" || lower.is_empty() {
+            return;
+        }
+
+        style.highlight = Some(trimmed.to_string());
+
+        if is_gray_highlight(&lower) {
+            style.role_id = 1;
+            style.printed = true;
+        } else {
+            let key = format!("highlight:{lower}");
+            let role_id = self.get_or_register(&key);
+            style.role_id = role_id;
+            style.printed = false;
+        }
+    }
+
+    /// 处理并应用文本颜色到 TextRunStyle。
+    pub fn apply_color(&mut self, val: &str, style: &mut TextRunStyle) {
+        let trimmed = val.trim();
+        if let Some(rgb) = parse_hex_color(trimmed) {
+            style.fill = Some(rgb);
+            if style.highlight.is_none() && rgb != [0, 0, 0] {
+                let key = format!("color:{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+                let role_id = self.get_or_register(&key);
+                style.role_id = role_id;
+            }
+        }
+    }
+}
+
+/// 解析单个 Run 时暂存的格式属性。
+#[derive(Default, Clone, Debug)]
+struct RawRunProps {
+    sz_half_pt: Option<u32>,
+    font_family: Option<String>,
+    highlight: Option<String>,
+    color: Option<String>,
+}
+
+impl RawRunProps {
+    fn apply_to(&self, style: &mut TextRunStyle, registry: &mut StyleRegistry) {
+        // 不再将 Word 中的 sz 设置为 style.font_size，保留信纸预设字号
+        if let Some(ref font) = self.font_family {
+            style.font_family = Some(font.clone());
+        }
+        if let Some(ref color_val) = self.color {
+            if let Some(rgb) = parse_hex_color(color_val) {
+                style.fill = Some(rgb);
+            }
+        }
+        if let Some(ref hl_val) = self.highlight {
+            registry.apply_highlight(hl_val, style);
+        } else if let Some(ref color_val) = self.color {
+            registry.apply_color(color_val, style);
+        }
+    }
+}
+
+/// 解析 6 位十六进制 RGB 颜色值（支持可选前导 #，忽略 "auto"）。
+fn parse_hex_color(val: &str) -> Option<[u8; 3]> {
+    let mut s = val.trim();
+    if s.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    if let Some(stripped) = s.strip_prefix('#') {
+        s = stripped;
+    }
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some([r, g, b])
+}
+
+/// 解析标签中的角色/样式配置。
+fn parse_tag_style(
+    tag_content: &str,
+    parent_style: &TextRunStyle,
+    registry: &mut StyleRegistry,
+) -> (String, TextRunStyle) {
+    let mut style = parent_style.clone();
+    let colon_pos = tag_content.find(':').or_else(|| tag_content.find('：'));
+    if let Some(pos) = colon_pos {
+        let colon_len = if tag_content.as_bytes()[pos] == b':' { 1 } else { '：'.len_utf8() };
+        let prefix = tag_content[..pos].trim();
+        let body = &tag_content[pos + colon_len..];
+
+        if prefix == "手写" {
+            style.role_id = 2;
+            style.printed = false;
+        } else if let Some(rest) = prefix.strip_prefix("手写") {
+            if rest.is_empty() {
+                style.role_id = 2;
+            } else if let Ok(n) = rest.parse::<u32>() {
+                style.role_id = if n <= 1 { 2 } else { n + 1 };
+            } else {
+                style.role_id = 2;
+            }
+            style.printed = false;
+        } else if prefix.starts_with("打印") {
+            style.role_id = 1;
+            style.printed = true;
+        } else if let Ok(n) = prefix.parse::<u32>() {
+            style.role_id = n;
+            style.printed = false;
+        } else {
+            let key = format!("tag:{prefix}");
+            let role_id = registry.get_or_register(&key);
+            style.role_id = role_id;
+            style.printed = false;
+        }
+        (body.to_string(), style)
+    } else {
+        style.role_id = 2;
+        style.printed = false;
+        (tag_content.to_string(), style)
+    }
+}
+
+/// 将单个 TextRun 中内嵌的 {{...}} 语法标签拆分为独立的 TextRun。
+fn split_syntax_tags(run: &TextRun, registry: &mut StyleRegistry) -> Vec<TextRun> {
+    let mut result = Vec::new();
+    let text = &run.text;
+    let mut cursor = 0;
+
+    while let Some(rel_start) = text[cursor..].find("{{") {
+        let tag_start = cursor + rel_start;
+        if let Some(rel_end) = text[tag_start + 2..].find("}}") {
+            let tag_content_start = tag_start + 2;
+            let tag_content_end = tag_start + 2 + rel_end;
+            let tag_end = tag_content_end + 2;
+
+            if tag_start > cursor {
+                let pre = &text[cursor..tag_start];
+                if !pre.is_empty() {
+                    result.push(TextRun::new(pre, run.style.clone()));
+                }
+            }
+
+            let tag_inner = &text[tag_content_start..tag_content_end];
+            let (clean_text, tag_style) = parse_tag_style(tag_inner, &run.style, registry);
+            if !clean_text.is_empty() {
+                result.push(TextRun::new(clean_text, tag_style));
+            }
+
+            cursor = tag_end;
+        } else {
+            break;
+        }
+    }
+
+    if cursor < text.len() {
+        let rem = &text[cursor..];
+        if !rem.is_empty() {
+            result.push(TextRun::new(rem, run.style.clone()));
+        }
+    }
+
+    result
+}
+
+/// 修剪整段文本的首尾空白，并同步修剪 runs 列表两端的字符/空格，保留词间空格。
+fn trim_paragraph_runs(runs: Vec<TextRun>) -> (String, Vec<TextRun>) {
+    let full_text: String = runs.iter().map(|r| r.text.as_str()).collect();
+    let trimmed_text = full_text.trim().to_string();
+    if trimmed_text.is_empty() {
+        return (String::new(), Vec::new());
+    }
+
+    let leading_ws_len = full_text.len() - full_text.trim_start().len();
+    let trailing_ws_len = full_text.len() - full_text.trim_end().len();
+
+    let mut result_runs = Vec::new();
+    let mut current_pos = 0;
+    let keep_start = leading_ws_len;
+    let keep_end = full_text.len() - trailing_ws_len;
+
+    for run in runs {
+        let run_len = run.text.len();
+        let run_start = current_pos;
+        let run_end = current_pos + run_len;
+        current_pos = run_end;
+
+        let slice_start = run_start.max(keep_start);
+        let slice_end = run_end.min(keep_end);
+
+        if slice_start < slice_end {
+            let offset_start = slice_start - run_start;
+            let offset_end = slice_end - run_start;
+            let sub_text = &run.text[offset_start..offset_end];
+            if !sub_text.is_empty() {
+                result_runs.push(TextRun::new(sub_text, run.style));
+            }
+        }
+    }
+
+    (trimmed_text, result_runs)
+}
+
+/// 处理 rPr 属性节点。
+fn handle_r_pr_tag(
+    e: &quick_xml::events::BytesStart,
+    raw: &mut RawRunProps,
+    fmt: &mut ParaFmt,
+) {
+    match local_name(e.name().as_ref().as_bytes()) {
+        b"sz" => {
+            if let Some(v) = attr_val(e, "val").and_then(|v| v.parse::<u32>().ok()) {
+                if fmt.run_sz_half_pt.is_none() {
+                    fmt.run_sz_half_pt = Some(v);
+                }
+                raw.sz_half_pt = Some(v);
+            }
+        }
+        b"highlight" => {
+            if let Some(v) = attr_val(e, "val") {
+                raw.highlight = Some(v);
+            }
+        }
+        b"color" => {
+            if let Some(v) = attr_val(e, "val") {
+                raw.color = Some(v);
+            }
+        }
+        b"rFonts" => {
+            let font = attr_val(e, "eastAsia")
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| attr_val(e, "ascii").filter(|s| !s.trim().is_empty()))
+                .or_else(|| attr_val(e, "hAnsi").filter(|s| !s.trim().is_empty()));
+            if font.is_some() {
+                raw.font_family = font;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 处理 pPr 属性节点。
+fn handle_p_pr_tag(e: &quick_xml::events::BytesStart, fmt: &mut ParaFmt) {
+    match local_name(e.name().as_ref().as_bytes()) {
+        b"pStyle" => {
+            if let Some(v) = attr_val(e, "val") {
+                fmt.style_id = Some(v);
+            }
+        }
+        b"jc" => {
+            if let Some(v) = attr_val(e, "val") {
+                fmt.jc = Some(v);
+            }
+        }
+        b"ind" => {
+            read_ind_attrs(e, fmt);
+        }
+        b"rFonts" => {
+            let font = attr_val(e, "eastAsia")
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| attr_val(e, "ascii").filter(|s| !s.trim().is_empty()))
+                .or_else(|| attr_val(e, "hAnsi").filter(|s| !s.trim().is_empty()))
+                .or_else(|| attr_val(e, "cs").filter(|s| !s.trim().is_empty()));
+            if font.is_some() {
+                fmt.font_family = font;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 解析 document.xml，返回 body 元素流（段落与表格按文档顺序交错）。
+fn parse_body_stream(xml: &str, registry: &mut StyleRegistry) -> Result<Vec<BodyElement>, String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+
+    let mut elements = Vec::new();
+    // ---- 段落状态（body 段落与单元格段落共用 run 累积机制）----
+    let mut in_body_para = false; // 当前 w:p 是 body 直接子级
+    let mut in_cell_para = false; // 当前 w:p 位于顶层表格单元格内
+    let mut tbl_depth: usize = 0; // 表格嵌套深度（>=2 的内层表格内容忽略）
+    let mut txbx_depth: usize = 0;
     let mut in_p_pr = false;
     let mut in_run = false;
     let mut in_r_pr = false;
-    let mut cur_text = String::new();
+    let mut in_t = false;
+
+    let mut cur_runs: Vec<TextRun> = Vec::new();
+    let mut cur_run_text = String::new();
+    let mut cur_run_props = RawRunProps::default();
     let mut cur_fmt = ParaFmt::default();
+
+    // ---- 表格状态 ----
+    let mut cur_table: Option<ParsedTable> = None;
+    let mut cur_row: Option<ParsedRow> = None;
+    let mut cur_cell: Option<ParsedCell> = None;
+    let mut row_col_cursor: usize = 0; // 当前行已占用列数
+    let mut in_tbl_grid = false; // 顶层 tblGrid 内
+    let mut in_tc_pr = false; // 当前单元格 tcPr 内
+    let mut cell_inner_tbl: usize = 0; // 单元格内嵌套表格深度（>0 忽略其文本）
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e)) => match local_name(e.name().as_ref()) {
-                b"tbl" => in_table = true,
-                b"p" if !in_table => {
-                    in_body_para = true;
-                    cur_text.clear();
-                    cur_fmt = ParaFmt::default();
-                }
-                b"pPr" if in_body_para => in_p_pr = true,
-                b"r" if in_body_para => in_run = true,
-                b"rPr" if in_run => in_r_pr = true,
-                _ => {}
-            },
-            Ok(Event::Empty(e)) => match local_name(e.name().as_ref()) {
-                b"tab" if in_body_para => cur_text.push('\t'),
-                b"br" if in_body_para => cur_text.push('\n'),
-                b"pStyle" if in_p_pr => {
-                    if let Some(v) = attr_val(&e, "val") {
-                        cur_fmt.style_id = Some(v);
+            Ok(Event::Start(e)) => {
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
+                if txbx_depth > 0 {
+                    if name == b"txbxContent" {
+                        txbx_depth += 1;
                     }
+                    continue;
                 }
-                b"jc" if in_p_pr => {
-                    if let Some(v) = attr_val(&e, "val") {
-                        cur_fmt.jc = Some(v);
+                match name {
+                    b"tbl" => {
+                        tbl_depth += 1;
+                        if tbl_depth == 1 {
+                            cur_table = Some(ParsedTable::default());
+                            row_col_cursor = 0;
+                        } else if tbl_depth == 2 {
+                            cell_inner_tbl += 1;
+                        }
                     }
-                }
-                b"ind" if in_p_pr => read_ind_attrs(&e, &mut cur_fmt),
-                b"sz" if in_r_pr && cur_fmt.run_sz_half_pt.is_none() => {
-                    cur_fmt.run_sz_half_pt = attr_val(&e, "val").and_then(|v| v.parse().ok());
-                }
-                _ => {}
-            },
-            Ok(Event::Text(t)) => {
-                if in_body_para {
-                    if let Ok(s) = std::str::from_utf8(t.as_ref()) {
-                        if let Ok(v) = unescape(s) {
-                            cur_text.push_str(&v);
+                    // 文本框（w:txbxContent）内的 w:p/w:r 会破坏外层段落状态，整体跳过
+                    b"txbxContent" => txbx_depth += 1,
+                    b"tblGrid" if tbl_depth == 1 && cur_row.is_none() => in_tbl_grid = true,
+                    b"gridCol" if in_tbl_grid => {
+                        if let Some(t) = cur_table.as_mut() {
+                            t.grid_cols += 1;
+                        }
+                    }
+                    b"tr" if tbl_depth == 1 => {
+                        cur_row = Some(ParsedRow::default());
+                        row_col_cursor = 0;
+                    }
+                    b"tc" if tbl_depth == 1 && cur_row.is_some() => {
+                        cur_cell = Some(ParsedCell { col_start: row_col_cursor, ..ParsedCell::default() });
+                        cell_inner_tbl = 0;
+                    }
+                    b"tcPr" if tbl_depth == 1 && cur_cell.is_some() => in_tc_pr = true,
+                    b"gridSpan" if tbl_depth == 1 && in_tc_pr => {
+                        if let Some(v) = attr_val(&e, "val").and_then(|v| v.parse::<usize>().ok()) {
+                            if let Some(c) = cur_cell.as_mut() {
+                                c.grid_span = v.max(1);
+                            }
+                        }
+                    }
+                    b"vMerge" if tbl_depth == 1 && in_tc_pr => {
+                        let restart = attr_val(&e, "val").is_some_and(|v| v == "restart");
+                        if let Some(c) = cur_cell.as_mut() {
+                            c.v_merge = if restart { CellVMerge::Restart } else { CellVMerge::Continue };
+                        }
+                    }
+                    b"p" if tbl_depth == 0 => {
+                        in_body_para = true;
+                        cur_runs.clear();
+                        cur_run_text.clear();
+                        cur_run_props = RawRunProps::default();
+                        cur_fmt = ParaFmt::default();
+                    }
+                    b"p" if tbl_depth == 1 && cur_cell.is_some() && cell_inner_tbl == 0 => {
+                        in_cell_para = true;
+                        cur_runs.clear();
+                        cur_run_text.clear();
+                        cur_run_props = RawRunProps::default();
+                        cur_fmt = ParaFmt::default();
+                    }
+                    b"pPr" if in_body_para || in_cell_para => {
+                        in_p_pr = true;
+                        handle_p_pr_tag(&e, &mut cur_fmt);
+                    }
+                    b"r" if in_body_para || in_cell_para => {
+                        flush_pending_run(&mut cur_run_text, &mut cur_run_props, &cur_fmt, &mut cur_runs, registry);
+                        in_run = true;
+                    }
+                    b"rPr" if in_run => {
+                        in_r_pr = true;
+                        handle_r_pr_tag(&e, &mut cur_run_props, &mut cur_fmt);
+                    }
+                    b"t" if in_body_para || in_cell_para => in_t = true,
+                    _ => {
+                        if in_p_pr {
+                            handle_p_pr_tag(&e, &mut cur_fmt);
+                        } else if in_r_pr {
+                            handle_r_pr_tag(&e, &mut cur_run_props, &mut cur_fmt);
                         }
                     }
                 }
             }
-            Ok(Event::End(e)) => match local_name(e.name().as_ref()) {
-                b"tbl" => in_table = false,
-                b"p" if in_body_para => {
-                    texts.push(std::mem::take(&mut cur_text));
-                    fmts.push(std::mem::take(&mut cur_fmt));
-                    in_body_para = false;
-                    in_p_pr = false;
-                    in_run = false;
-                    in_r_pr = false;
+            Ok(Event::Empty(e)) => {
+                if txbx_depth > 0 {
+                    continue;
                 }
-                b"pPr" => in_p_pr = false,
-                b"r" => {
-                    in_run = false;
-                    in_r_pr = false;
+                match local_name(e.name().as_ref().as_bytes()) {
+                    b"tab" if in_body_para || in_cell_para => cur_run_text.push('\t'),
+                    b"br" | b"cr" if in_body_para || in_cell_para => cur_run_text.push('\n'),
+                    // 实际文档中 w:gridCol 为自闭合（无子元素），需在 Empty 事件计数
+                    b"gridCol" if in_tbl_grid => {
+                        if let Some(t) = cur_table.as_mut() {
+                            t.grid_cols += 1;
+                        }
+                    }
+                    b"gridSpan" if tbl_depth == 1 && in_tc_pr => {
+                        if let Some(v) = attr_val(&e, "val").and_then(|v| v.parse::<usize>().ok()) {
+                            if let Some(c) = cur_cell.as_mut() {
+                                c.grid_span = v.max(1);
+                            }
+                        }
+                    }
+                    b"vMerge" if tbl_depth == 1 && in_tc_pr => {
+                        let restart = attr_val(&e, "val").is_some_and(|v| v == "restart");
+                        if let Some(c) = cur_cell.as_mut() {
+                            c.v_merge = if restart { CellVMerge::Restart } else { CellVMerge::Continue };
+                        }
+                    }
+                    _ => {
+                        if in_p_pr {
+                            handle_p_pr_tag(&e, &mut cur_fmt);
+                        } else if in_r_pr {
+                            handle_r_pr_tag(&e, &mut cur_run_props, &mut cur_fmt);
+                        }
+                    }
                 }
-                b"rPr" => in_r_pr = false,
-                _ => {}
-            },
+            }
+            Ok(Event::Text(t)) => {
+                if txbx_depth > 0 || cell_inner_tbl > 0 || !((in_body_para || in_cell_para) && in_t) {
+                    continue;
+                }
+                // quick-xml 0.42 起 `BytesText::as_ref()` 已是 `&str`（内部完成 UTF-8 校验），
+                // 无需再走 `std::str::from_utf8`
+                if let Ok(v) = unescape(t.as_ref()) {
+                    cur_run_text.push_str(&v);
+                }
+            }
+            Ok(Event::End(e)) => {
+                let qname = e.name();
+                let name = local_name(qname.as_ref().as_bytes());
+                if txbx_depth > 0 {
+                    if name == b"txbxContent" {
+                        txbx_depth -= 1;
+                    }
+                    continue;
+                }
+                match name {
+                    b"tbl" => {
+                        if tbl_depth >= 2 && cell_inner_tbl > 0 {
+                            cell_inner_tbl -= 1;
+                        }
+                        tbl_depth = tbl_depth.saturating_sub(1);
+                        if tbl_depth == 0 {
+                            if let Some(mut t) = cur_table.take() {
+                                if t.grid_cols == 0 {
+                                    t.grid_cols = t
+                                        .rows
+                                        .first()
+                                        .map(|r| r.cells.iter().map(|c| c.grid_span).sum())
+                                        .unwrap_or(0);
+                                }
+                                elements.push(BodyElement::Table(t));
+                            }
+                            cur_row = None;
+                            cur_cell = None;
+                            in_tbl_grid = false;
+                        }
+                    }
+                    b"tblGrid" => in_tbl_grid = false,
+                    b"tr" if tbl_depth == 1 => {
+                        if let Some(row) = cur_row.take() {
+                            if let Some(t) = cur_table.as_mut() {
+                                t.rows.push(row);
+                            }
+                        }
+                    }
+                    b"tc" if tbl_depth == 1 && cur_cell.is_some() => {
+                        if let Some(mut cell) = cur_cell.take() {
+                            // vMerge 续行格通常不重复 gridSpan：未显式声明时从上方覆盖同列的合并格继承跨列数
+                            if cell.v_merge == CellVMerge::Continue && cell.grid_span == 1 {
+                                let span_above = cur_table.as_ref().and_then(|t| {
+                                    t.rows.iter().rev().find_map(|r| {
+                                        r.cells
+                                            .iter()
+                                            .find(|c| cell.col_start >= c.col_start && cell.col_start < c.col_start + c.grid_span)
+                                            .map(|c| c.grid_span)
+                                    })
+                                });
+                                if let Some(span) = span_above {
+                                    cell.grid_span = span;
+                                }
+                            }
+                            if let Some(row) = cur_row.as_mut() {
+                                row_col_cursor += cell.grid_span;
+                                row.cells.push(cell);
+                            }
+                        }
+                        in_tc_pr = false;
+                    }
+                    b"tcPr" => in_tc_pr = false,
+                    b"t" => in_t = false,
+                    b"rPr" => in_r_pr = false,
+                    b"r" => {
+                        flush_pending_run(&mut cur_run_text, &mut cur_run_props, &cur_fmt, &mut cur_runs, registry);
+                        in_run = false;
+                        in_r_pr = false;
+                        cur_run_props = RawRunProps::default();
+                    }
+                    b"pPr" => in_p_pr = false,
+                    b"p" if in_body_para => {
+                        flush_pending_run(&mut cur_run_text, &mut cur_run_props, &cur_fmt, &mut cur_runs, registry);
+                        elements.push(BodyElement::Paragraph(ParsedParagraph {
+                            runs: std::mem::take(&mut cur_runs),
+                            fmt: std::mem::take(&mut cur_fmt),
+                        }));
+                        in_body_para = false;
+                        in_p_pr = false;
+                        in_run = false;
+                        in_r_pr = false;
+                        in_t = false;
+                    }
+                    b"p" if in_cell_para => {
+                        flush_pending_run(&mut cur_run_text, &mut cur_run_props, &cur_fmt, &mut cur_runs, registry);
+                        if let Some(cell) = cur_cell.as_mut() {
+                            if cell.runs.is_empty() {
+                                cell.fmt = cur_fmt.clone();
+                            }
+                            if !cur_runs.is_empty() {
+                                if !cell.runs.is_empty() {
+                                    cell.runs.push(TextRun::from_text("\n"));
+                                }
+                                cell.runs.append(&mut cur_runs);
+                            }
+                        }
+                        in_cell_para = false;
+                        in_p_pr = false;
+                        in_run = false;
+                        in_r_pr = false;
+                        in_t = false;
+                        cur_run_props = RawRunProps::default();
+                    }
+                    _ => {}
+                }
+            }
             Ok(Event::Eof) => break,
             Err(e) => return Err(format!("解析 document.xml 失败：{e}")),
             _ => {}
         }
     }
-    Ok((texts, fmts))
+    Ok(elements)
+}
+
+/// 供 docx_tables 单元测试触发解析（crate 内可见）。
+#[cfg(test)]
+pub(crate) fn parse_body_stream_for_test(xml: &str, registry: &mut StyleRegistry) -> Result<Vec<BodyElement>, String> {
+    parse_body_stream(xml, registry)
+}
+
+/// 把累积中的 run 文本落为 TextRun（run 开始/结束、段落结束时调用）。
+fn flush_pending_run(
+    cur_run_text: &mut String,
+    cur_run_props: &mut RawRunProps,
+    cur_fmt: &ParaFmt,
+    cur_runs: &mut Vec<TextRun>,
+    registry: &mut StyleRegistry,
+) {
+    if cur_run_text.is_empty() {
+        return;
+    }
+    let mut style = TextRunStyle::default();
+    if cur_run_props.font_family.is_none() && cur_fmt.font_family.is_some() {
+        cur_run_props.font_family = cur_fmt.font_family.clone();
+    }
+    cur_run_props.apply_to(&mut style, registry);
+    cur_runs.push(TextRun::new(std::mem::take(cur_run_text), style));
 }
 
 /// 读取 `w:ind` 的首行缩进属性（firstLineChars / firstLine）。
@@ -201,7 +934,7 @@ fn read_ind_attrs(e: &quick_xml::events::BytesStart, fmt: &mut ParaFmt) {
 fn attr_val(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
     for attr in e.attributes() {
         let Ok(attr) = attr else { continue };
-        if local_name(attr.key.as_ref()) == name.as_bytes() {
+        if local_name(attr.key.as_ref().as_bytes()) == name.as_bytes() {
             return attr
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .ok()
@@ -233,7 +966,7 @@ fn parse_styles(xml: &Option<String>) -> (Vec<StyleDef>, Option<u32>) {
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e)) => match local_name(e.name().as_ref()) {
+            Ok(Event::Start(e)) => match local_name(e.name().as_ref().as_bytes()) {
                 b"style" => {
                     in_style = true;
                     let style_id = attr_val(&e, "styleId").unwrap_or_default();
@@ -253,7 +986,7 @@ fn parse_styles(xml: &Option<String>) -> (Vec<StyleDef>, Option<u32>) {
                 b"rPr" if in_r_pr_default => in_r_pr = true,
                 _ => {}
             },
-            Ok(Event::Empty(e)) => match local_name(e.name().as_ref()) {
+            Ok(Event::Empty(e)) => match local_name(e.name().as_ref().as_bytes()) {
                 b"basedOn" if in_style => {
                     if let Some(s) = cur.as_mut() {
                         s.based_on = attr_val(&e, "val");
@@ -292,7 +1025,7 @@ fn parse_styles(xml: &Option<String>) -> (Vec<StyleDef>, Option<u32>) {
                 }
                 _ => {}
             },
-            Ok(Event::End(e)) => match local_name(e.name().as_ref()) {
+            Ok(Event::End(e)) => match local_name(e.name().as_ref().as_bytes()) {
                 b"style" => {
                     if let Some(s) = cur.take() {
                         styles.push(s);
@@ -398,6 +1131,16 @@ fn resolve_indent(fmt: &ParaFmt, font_size: f32, styles: &[StyleDef], doc_defaul
         }
     }
     0.0
+}
+
+/// 读取 docx 文件并解析 body 元素流（表格识别用；样式链不参与，段落仅用于匹配消耗）。
+pub(crate) fn load_body_stream(path: &Path) -> Result<Vec<BodyElement>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("读取 docx {path:?} 失败：{e}"))?;
+    let mut archive =
+        ZipArchive::new(Cursor::new(bytes.as_slice())).map_err(|e| format!("解压 docx {path:?} 失败：{e}"))?;
+    let document_xml = read_entry(&mut archive, "word/document.xml")?;
+    let mut registry = StyleRegistry::new();
+    parse_body_stream(&document_xml, &mut registry)
 }
 
 #[cfg(test)]
@@ -645,5 +1388,338 @@ mod tests {
         let paras = load_paragraphs(&path, 36.0).unwrap();
         assert_eq!(paras.len(), 1);
         assert_eq!(paras[0].text, "前链接后");
+    }
+
+    #[test]
+    fn test_docx_with_highlights() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:rPr><w:highlight w:val="yellow"/></w:rPr><w:t>黄</w:t></w:r><w:r><w:rPr><w:highlight w:val="green"/></w:rPr><w:t>绿</w:t></w:r><w:r><w:rPr><w:highlight w:val="cyan"/></w:rPr><w:t>青</w:t></w:r><w:r><w:rPr><w:highlight w:val="magenta"/></w:rPr><w:t>品红</w:t></w:r><w:r><w:rPr><w:highlight w:val="lightGray"/></w:rPr><w:t>印刷灰</w:t></w:r></w:p></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("highlights.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let paras = load_paragraphs(&path, 36.0).unwrap();
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].runs.len(), 5);
+        assert_eq!(paras[0].runs[0].text, "黄");
+        assert_eq!(paras[0].runs[0].style.role_id, 2);
+        assert_eq!(paras[0].runs[0].style.highlight.as_deref(), Some("yellow"));
+        assert_eq!(paras[0].runs[1].text, "绿");
+        assert_eq!(paras[0].runs[1].style.role_id, 3);
+        assert_eq!(paras[0].runs[1].style.highlight.as_deref(), Some("green"));
+        assert_eq!(paras[0].runs[2].text, "青");
+        assert_eq!(paras[0].runs[2].style.role_id, 4);
+        assert_eq!(paras[0].runs[2].style.highlight.as_deref(), Some("cyan"));
+        assert_eq!(paras[0].runs[3].text, "品红");
+        assert_eq!(paras[0].runs[3].style.role_id, 5);
+        assert_eq!(paras[0].runs[3].style.highlight.as_deref(), Some("magenta"));
+        assert_eq!(paras[0].runs[4].text, "印刷灰");
+        assert_eq!(paras[0].runs[4].style.role_id, 1);
+        assert_eq!(paras[0].runs[4].style.highlight.as_deref(), Some("lightGray"));
+        assert!(paras[0].runs[4].style.printed);
+    }
+
+    #[test]
+    fn test_docx_dynamic_color_allocation() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:rPr><w:highlight w:val="pink"/></w:rPr><w:t>粉色段落</w:t></w:r></w:p><w:p><w:r><w:rPr><w:highlight w:val="darkBlue"/></w:rPr><w:t>深蓝段落</w:t></w:r></w:p><w:p><w:r><w:rPr><w:highlight w:val="pink"/></w:rPr><w:t>再次粉色</w:t></w:r></w:p></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dynamic_highlight.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let paras = load_paragraphs(&path, 36.0).unwrap();
+        assert_eq!(paras.len(), 3);
+
+        // 第 1 段：pink 首次出现 -> 分配 role_id: 2
+        assert_eq!(paras[0].runs.len(), 1);
+        assert_eq!(paras[0].runs[0].text, "粉色段落");
+        assert_eq!(paras[0].runs[0].style.role_id, 2);
+        assert_eq!(paras[0].runs[0].style.highlight.as_deref(), Some("pink"));
+        assert!(!paras[0].runs[0].style.printed);
+
+        // 第 2 段：darkBlue 首次出现 -> 分配 role_id: 3
+        assert_eq!(paras[1].runs.len(), 1);
+        assert_eq!(paras[1].runs[0].text, "深蓝段落");
+        assert_eq!(paras[1].runs[0].style.role_id, 3);
+        assert_eq!(paras[1].runs[0].style.highlight.as_deref(), Some("darkBlue"));
+        assert!(!paras[1].runs[0].style.printed);
+
+        // 第 3 段：pink 再次出现 -> 复用 role_id: 2
+        assert_eq!(paras[2].runs.len(), 1);
+        assert_eq!(paras[2].runs[0].text, "再次粉色");
+        assert_eq!(paras[2].runs[0].style.role_id, 2);
+        assert_eq!(paras[2].runs[0].style.highlight.as_deref(), Some("pink"));
+        assert!(!paras[2].runs[0].style.printed);
+    }
+
+    #[test]
+    fn test_docx_with_color_and_size() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:rPr><w:color w:val="FF0000"/><w:sz w:val="48"/></w:rPr><w:t>红色大字</w:t></w:r></w:p></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("color_size.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let paras = load_paragraphs(&path, 36.0).unwrap();
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].runs.len(), 1);
+        assert_eq!(paras[0].runs[0].text, "红色大字");
+        assert_eq!(paras[0].runs[0].style.fill, Some([255, 0, 0]));
+        assert_eq!(paras[0].runs[0].style.font_size, None);
+    }
+
+    #[test]
+    fn test_docx_with_syntax_tags() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>正文{{手写:已批准}}后续</w:t></w:r></w:p></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("syntax_tags.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let paras = load_paragraphs(&path, 36.0).unwrap();
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].text, "正文已批准后续");
+        assert_eq!(paras[0].runs.len(), 3);
+        assert_eq!(paras[0].runs[0].text, "正文");
+        assert_eq!(paras[0].runs[0].style.role_id, 1);
+        assert!(paras[0].runs[0].style.printed);
+        assert_eq!(paras[0].runs[1].text, "已批准");
+        assert_eq!(paras[0].runs[1].style.role_id, 2);
+        assert!(!paras[0].runs[1].style.printed);
+        assert_eq!(paras[0].runs[2].text, "后续");
+        assert_eq!(paras[0].runs[2].style.role_id, 1);
+        assert!(paras[0].runs[2].style.printed);
+    }
+
+    #[test]
+    fn test_docx_with_extended_syntax_tags() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{{手写2:老师批注}}{{打印:注意事项}}{{1:学生A}}{{2:学生B}}{{默认手写}}</w:t></w:r></w:p></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extended_tags.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let paras = load_paragraphs(&path, 36.0).unwrap();
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].runs.len(), 5);
+
+        assert_eq!(paras[0].runs[0].text, "老师批注");
+        assert_eq!(paras[0].runs[0].style.role_id, 3);
+        assert!(!paras[0].runs[0].style.printed);
+
+        assert_eq!(paras[0].runs[1].text, "注意事项");
+        assert_eq!(paras[0].runs[1].style.role_id, 1);
+        assert!(paras[0].runs[1].style.printed);
+
+        assert_eq!(paras[0].runs[2].text, "学生A");
+        assert_eq!(paras[0].runs[2].style.role_id, 1);
+        assert!(!paras[0].runs[2].style.printed);
+
+        assert_eq!(paras[0].runs[3].text, "学生B");
+        assert_eq!(paras[0].runs[3].style.role_id, 2);
+        assert!(!paras[0].runs[3].style.printed);
+
+        assert_eq!(paras[0].runs[4].text, "默认手写");
+        assert_eq!(paras[0].runs[4].style.role_id, 2);
+        assert!(!paras[0].runs[4].style.printed);
+    }
+
+    #[test]
+    fn test_docx_no_highlights_is_full_handwriting() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>第一段纯手写</w:t></w:r></w:p><w:p><w:r><w:t>第二段纯手写</w:t></w:r></w:p></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_highlights.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let paras = load_paragraphs(&path, 36.0).unwrap();
+        assert_eq!(paras.len(), 2);
+        for p in &paras {
+            for r in &p.runs {
+                assert_eq!(r.style.role_id, 0);
+                assert!(!r.style.printed);
+            }
+        }
+    }
+
+    #[test]
+    fn test_docx_printed_tag_survives_full_handwriting_mode() {
+        // 文档无任何高亮：纯手写模式，但显式 {{打印:}} 标签应保留而不是被重置为手写
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{{打印:标题}}正文手写</w:t></w:r></w:p></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("printed_tag_only.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let paras = load_paragraphs(&path, 36.0).unwrap();
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].runs.len(), 2);
+        assert_eq!(paras[0].runs[0].text, "标题");
+        assert_eq!(paras[0].runs[0].style.role_id, 1);
+        assert!(paras[0].runs[0].style.printed);
+        assert_eq!(paras[0].runs[1].text, "正文手写");
+        assert_eq!(paras[0].runs[1].style.role_id, 0);
+        assert!(!paras[0].runs[1].style.printed);
+    }
+
+    #[test]
+    fn test_docx_nested_table_paragraphs_do_not_leak_into_body() {
+        // 嵌套表格：内层 </w:tbl> 不应结束外层表格上下文，
+        // 外层表格中的段落不应泄入正文段落列表（对齐 python-docx doc.paragraphs）
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>正文段落</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:tbl><w:tr><w:tc><w:p><w:r><w:t>内层表格</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>外层表格段落</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested_table.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let paras = load_paragraphs(&path, 36.0).unwrap();
+        assert_eq!(paras.len(), 1, "表格内段落（含嵌套）不应出现在正文段落中：{paras:?}");
+        assert_eq!(paras[0].runs[0].text, "正文段落");
+    }
+
+    #[test]
+    fn test_docx_textbox_content_is_skipped() {
+        // 段落中的文本框（w:txbxContent）内含独立 w:p/w:r：
+        // 应整体跳过，不得清空外层已累积 runs 或提前闭合外层段落
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>前文</w:t></w:r><w:r><w:drawing><wps:txbx><w:txbxContent><w:p><w:r><w:t>文本框内容</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing></w:r><w:r><w:t>后文</w:t></w:r></w:p></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("textbox.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let paras = load_paragraphs(&path, 36.0).unwrap();
+        assert_eq!(paras.len(), 1, "文本框内段落不应成为独立正文段落：{paras:?}");
+        let text: String = paras[0].runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(text, "前文后文", "文本框文字不应混入正文，外层段落文字不应丢失");
+    }
+
+    #[test]
+    fn test_docx_with_highlights_converts_unmarked_to_printed() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>未高亮模板前缀</w:t></w:r><w:r><w:rPr><w:highlight w:val="yellow"/></w:rPr><w:t>黄色高亮填空</w:t></w:r><w:r><w:t>未高亮模板后缀</w:t></w:r></w:p></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dual_mode.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let paras = load_paragraphs(&path, 36.0).unwrap();
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].runs.len(), 3);
+
+        // Run 0: unmarked -> converted to printed
+        assert_eq!(paras[0].runs[0].text, "未高亮模板前缀");
+        assert_eq!(paras[0].runs[0].style.role_id, 1);
+        assert!(paras[0].runs[0].style.printed);
+
+        // Run 1: yellow highlight -> role_id 2, handwriting (printed = false)
+        assert_eq!(paras[0].runs[1].text, "黄色高亮填空");
+        assert_eq!(paras[0].runs[1].style.role_id, 2);
+        assert_eq!(paras[0].runs[1].style.highlight.as_deref(), Some("yellow"));
+        assert!(!paras[0].runs[1].style.printed);
+
+        // Run 2: unmarked -> converted to printed
+        assert_eq!(paras[0].runs[2].text, "未高亮模板后缀");
+        assert_eq!(paras[0].runs[2].style.role_id, 1);
+        assert!(paras[0].runs[2].style.printed);
+    }
+
+    #[test]
+    fn test_docx_font_size_not_overridden() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:rPr><w:sz w:val="28"/></w:rPr><w:t>字号测试</w:t></w:r></w:p></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("font_sz.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let paras = load_paragraphs(&path, 36.0).unwrap();
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].runs[0].style.font_size, None);
+    }
+
+    #[test]
+    fn test_docx_rfonts_extraction() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:rPr><w:rFonts w:eastAsia="仿宋_GB2312" w:ascii="Calibri"/></w:rPr><w:t>字体测试</w:t></w:r></w:p></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rfonts.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let paras = load_paragraphs(&path, 36.0).unwrap();
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].runs[0].style.font_family.as_deref(), Some("仿宋_GB2312"));
+        assert_eq!(detect_doc_font_family(&paras).as_deref(), Some("仿宋_GB2312"));
+    }
+
+    #[test]
+    fn test_docx_multi_font_family_extraction() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:rPr><w:rFonts w:eastAsia="黑体"/></w:rPr><w:t>黑体标题</w:t></w:r><w:r><w:rPr><w:rFonts w:eastAsia="宋体"/></w:rPr><w:t>宋体副标题</w:t></w:r></w:p><w:p><w:r><w:rPr><w:rFonts w:eastAsia="仿宋_GB2312"/></w:rPr><w:t>仿宋正文</w:t></w:r></w:p></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi_font.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let paras = load_paragraphs(&path, 36.0).unwrap();
+        assert_eq!(paras.len(), 2);
+        assert_eq!(paras[0].runs.len(), 2);
+        assert_eq!(paras[0].runs[0].text, "黑体标题");
+        assert_eq!(paras[0].runs[0].style.font_family.as_deref(), Some("黑体"));
+        assert_eq!(paras[0].runs[1].text, "宋体副标题");
+        assert_eq!(paras[0].runs[1].style.font_family.as_deref(), Some("宋体"));
+
+        assert_eq!(paras[1].runs.len(), 1);
+        assert_eq!(paras[1].runs[0].text, "仿宋正文");
+        assert_eq!(paras[1].runs[0].style.font_family.as_deref(), Some("仿宋_GB2312"));
+    }
+
+    #[test]
+    fn body_stream_parses_table_structure() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>表前段落</w:t></w:r></w:p><w:tbl><w:tblGrid><w:gridCol/><w:gridCol/><w:gridCol/></w:tblGrid><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>合并格</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>丙</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p><w:r><w:t></w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>丁</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>表后段落</w:t></w:r></w:p></w:body></w:document>"#;
+        let mut registry = StyleRegistry::new();
+        let stream = parse_body_stream(document_xml, &mut registry).unwrap();
+        assert_eq!(stream.len(), 3);
+        assert!(matches!(&stream[0], BodyElement::Paragraph(p) if p.runs[0].text == "表前段落"));
+        assert!(matches!(&stream[2], BodyElement::Paragraph(p) if p.runs[0].text == "表后段落"));
+        let table = match &stream[1] { BodyElement::Table(t) => t, _ => panic!("应为表格") };
+        assert_eq!(table.grid_cols, 3);
+        assert_eq!(table.rows.len(), 2);
+        // 第一行：跨 2 列的 vMerge 起始格 + 单格
+        let c00 = &table.rows[0].cells[0];
+        assert_eq!(c00.col_start, 0);
+        assert_eq!(c00.grid_span, 2);
+        assert_eq!(c00.v_merge, CellVMerge::Restart);
+        assert_eq!(c00.runs[0].text, "合并格");
+        let c01 = &table.rows[0].cells[1];
+        assert_eq!(c01.col_start, 2);
+        assert_eq!(c01.grid_span, 1);
+        // 第二行：vMerge 续行格占列但无内容 + 单格
+        let c10 = &table.rows[1].cells[0];
+        assert_eq!(c10.col_start, 0);
+        assert_eq!(c10.grid_span, 2);
+        assert_eq!(c10.v_merge, CellVMerge::Continue);
+        let c11 = &table.rows[1].cells[1];
+        assert_eq!(c11.col_start, 2);
+        assert_eq!(c11.runs[0].text, "丁");
+    }
+
+    #[test]
+    fn load_body_stream_reads_docx_file() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tr><w:tc><w:p><w:r><w:t>格</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.docx");
+        std::fs::write(&path, zip_docx(document_xml.as_bytes(), None)).unwrap();
+        let stream = load_body_stream(&path).unwrap();
+        assert_eq!(stream.len(), 1);
+        assert!(matches!(&stream[0], BodyElement::Table(_)));
+    }
+
+    #[test]
+    fn nested_table_content_not_leaked_into_outer_cell() {
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tr><w:tc><w:p><w:r><w:t>外层</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>内层</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:tc></w:tr></w:tbl></w:body></w:document>"#;
+        let mut registry = StyleRegistry::new();
+        let stream = parse_body_stream(document_xml, &mut registry).unwrap();
+        let table = match &stream[0] { BodyElement::Table(t) => t, _ => panic!() };
+        let text: String = table.rows[0].cells[0].runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(text, "外层");
+    }
+
+    #[test]
+    fn nested_table_cell_props_do_not_leak_into_outer_cell() {
+        // 外层格内嵌套表格：嵌套格 tcPr 的 gridSpan/vMerge 不应覆盖外层格属性，
+        // 否则 row_col_cursor 与后续格 col_start 会被污染
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tblGrid><w:gridCol/><w:gridCol/></w:tblGrid><w:tr><w:tc><w:tbl><w:tr><w:tc><w:tcPr><w:gridSpan w:val="3"/><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>内层</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:tc><w:tc><w:p><w:r><w:t>次格</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>"#;
+        let mut registry = StyleRegistry::new();
+        let stream = parse_body_stream(document_xml, &mut registry).unwrap();
+        let table = match &stream[0] { BodyElement::Table(t) => t, _ => panic!() };
+        let c00 = &table.rows[0].cells[0];
+        assert_eq!(c00.grid_span, 1, "嵌套表格的 gridSpan 不应泄入外层格");
+        assert_eq!(c00.v_merge, CellVMerge::None, "嵌套表格的 vMerge 不应泄入外层格");
+        let c01 = &table.rows[0].cells[1];
+        assert_eq!(c01.col_start, 1, "外层格跨列未被污染时，同行后续格列号应正确");
+    }
+
+    #[test]
+    fn self_closing_grid_cols_counted_from_tbl_grid() {
+        // 实际文档（Word/WPS/LibreOffice）中 w:gridCol 为自闭合（Empty 事件）：
+        // tblGrid 列数应直接计数，而非走首行 gridSpan 总和回退
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tblGrid><w:gridCol w:w="850"/><w:gridCol w:w="850"/><w:gridCol w:w="850"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>仅一格</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>"#;
+        let mut registry = StyleRegistry::new();
+        let stream = parse_body_stream(document_xml, &mut registry).unwrap();
+        let table = match &stream[0] { BodyElement::Table(t) => t, _ => panic!() };
+        assert_eq!(table.grid_cols, 3, "自闭合 gridCol 应计入 tblGrid 列数（首行回退只会得 1）");
+        assert_eq!(table.rows[0].cells.len(), 1);
+        assert_eq!(table.rows[0].cells[0].grid_span, 1);
     }
 }

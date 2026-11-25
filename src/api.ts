@@ -3,8 +3,18 @@
 //! 命令名/参数与 src-tauri/src/main.rs 一一对应（v2 自动做 camelCase ↔ snake_case）。
 
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import type { PngPage, PresetItem, UiParams } from "./types";
+import type {
+  DocxImportOutput,
+  DocumentImportResult,
+  DownloadProgressPayload,
+  PngPage,
+  PresetItem,
+  SystemFontItem,
+  UiParams,
+  UpdateInfo,
+} from "./types";
 
 /** 本地文件 → asset 协议 URL（需 tauri.conf.json assetProtocol scope 覆盖） */
 export const assetUrl = (path: string): string => convertFileSrc(path);
@@ -15,10 +25,11 @@ export const api = {
     invoke<string[]>("export_files", { params, dir }),
   exportPdf: (params: UiParams, path: string) =>
     invoke<void>("export_pdf", { params, path }),
-  /** 返回 [文本, 对齐(0/1/2), 首行缩进像素] 行 */
+  /** 返回 DocxImportOutput（段落文本、对齐、首行缩进 em、富文本 Runs 与检测到的文档字体） */
   importDocx: (path: string, fontSize: number) =>
-    invoke<[string, number, number][]>("import_docx", { path, fontSize }),
-  importDocument: (path: string) => invoke<string[]>("import_document", { path }),
+    invoke<DocxImportOutput>("import_docx", { path, fontSize }),
+  importDocument: (path: string, extractRegions?: boolean) =>
+    invoke<DocumentImportResult>("import_document", { path, extractRegions }),
   listPresets: () => invoke<PresetItem[]>("list_presets"),
   loadPreset: (path: string) => invoke<UiParams>("load_preset", { path }),
   savePreset: (params: UiParams, path: string) =>
@@ -28,7 +39,31 @@ export const api = {
   /** 只读图片文件头，返回 [宽, 高]；失败为 null（框选坐标换算用） */
   imageDimensions: (path: string) =>
     invoke<[number, number] | null>("image_dimensions", { path }),
+  /** 检查更新：查询 GitHub Releases 最新版本 */
+  checkForUpdates: (currentVersion: string) =>
+    invoke<UpdateInfo>("check_for_updates", { currentVersion }),
+  /** 分块下载更新包到本地临时目录 */
+  downloadUpdate: (url: string, fileName?: string) =>
+    invoke<string>("download_update", { url, fileName }),
+  /** 启动 Windows 便携版覆盖重启脚本 */
+  applyPortableUpdate: (newFilePath: string) =>
+    invoke<void>("apply_portable_update", { newFilePath }),
+  /** 调用系统默认浏览器打开 URL */
+  openUrl: (url: string) => invoke<void>("open_url", { url }),
+  /** 监听下载进度推送 */
+  onDownloadProgress: (cb: (payload: DownloadProgressPayload) => void) =>
+    listen<DownloadProgressPayload>("update-download-progress", (e) => cb(e.payload)),
+  /** 获取系统当前原生深浅色主题 */
+  getSystemTheme: () => invoke<string>("get_system_theme"),
+  /** 监听操作系统主题切换事件 */
+  onSystemThemeChanged: (cb: (theme: string) => void) =>
+    listen<string>("system-theme-changed", (e) => cb(e.payload)),
+  /** 获取系统已安装字体列表 */
+  listSystemFonts: () => invoke<SystemFontItem[]>("list_system_fonts"),
 };
+
+
+
 
 const filters = {
   font: [{ name: "字体文件", extensions: ["ttf", "ttc", "otf"] }],

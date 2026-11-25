@@ -1,6 +1,8 @@
 [package]
 name = "handwrite-sim-tauri"
-version = "0.1.0"
+version = "0.6.0"
+
+
 edition = "2021"
 description = "手写模拟器桌面端（Tauri 2）：复用 crates/core 渲染引擎，Vue 前端位于仓库根目录"
 license = "MIT"
@@ -19,5 +21,10 @@ tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "blocking", "default-tls"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 handwrite-sim = { path = "../crates/core" }
+
+
+

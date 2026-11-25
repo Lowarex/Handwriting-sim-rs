@@ -1,11 +1,57 @@
 //! 前端 ↔ 后端共享类型：与 src-tauri/src/params.rs 的 UiParams 镜像（camelCase）。
 
+export interface UiTextRunStyle {
+  roleId?: number;
+  highlight?: string | null;
+  fontPath?: string | null;
+  fontFamily?: string | null;
+  fontSize?: number | null;
+  fill?: string | null;
+  printed?: boolean;
+}
+
+export interface UiTextRun {
+  text: string;
+  style?: UiTextRunStyle;
+}
+
+export interface DocxImportOutput {
+  paragraphs: UiParagraph[];
+  docFontFamily?: string | null;
+}
+
+export interface DocumentImportResult {
+  pages: string[];
+  regions: UiRegion[];
+}
+
 export interface UiParagraph {
   text: string;
   /** 0 左对齐 / 1 居中 / 2 右对齐 */
   align: number;
   /** 首行缩进（字符数 em） */
   indentEm: number;
+  runs?: UiTextRun[];
+}
+
+export interface UiHandwritingRole {
+  id: number;
+  name: string;
+  highlight?: string | null;
+  fontPath: string;
+  printed: boolean;
+  fontSize?: number | null;
+  fill?: string | null;
+  wordSpacing?: number | null;
+  lineSpacing?: number | null;
+  fontSizeSigma?: number | null;
+  wordSpacingSigma?: number | null;
+  lineSpacingSigma?: number | null;
+  perturbXSigma?: number | null;
+  perturbYSigma?: number | null;
+  perturbThetaSigma?: number | null;
+  miswriteRate?: number | null;
+  miswriteStrikeoutStyleIndex?: number | null;
 }
 
 /** 框选文字区域（背景原始像素坐标） */
@@ -15,10 +61,16 @@ export interface UiRegion {
   w: number;
   h: number;
   text: string;
+  /** 绑定的角色 ID（0 为默认角色） */
+  roleId?: number;
+  /** 绑定的高亮颜色名称（如 "yellow", "cyan", "pink", null = 无高亮） */
+  highlight?: string | null;
   fontPath: string;
   printed: boolean;
   fontSize: number;
   page: number;
+  /** 所属表格序号（1 基；null = 非表格区域） */
+  tableIndex?: number | null;
   /** 对齐方式：0 左 / 1 居中 / 2 右（应用于区域整体文本） */
   align: number;
   /** 首行缩进（字符数 em；0 = 无） */
@@ -72,6 +124,7 @@ export interface UiParams {
   text: string;
   paragraphs: UiParagraph[];
   regions: UiRegion[];
+  roles?: UiHandwritingRole[];
   endChars: string;
   startChars: string;
   boundsVisible: boolean;
@@ -89,3 +142,28 @@ export interface PresetItem {
   name: string;
   path: string;
 }
+
+export interface UpdateInfo {
+  version: string;
+  tagName: string;
+  title: string;
+  body: string;
+  htmlUrl: string;
+  assetName: string;
+  assetUrl: string;
+  assetSize: number;
+  hasUpdate: boolean;
+}
+
+export interface DownloadProgressPayload {
+  received: number;
+  total: number;
+  percent: number;
+}
+
+export interface SystemFontItem {
+  name: string;
+  family: string;
+  path: string;
+}
+

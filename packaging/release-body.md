@@ -1,28 +1,15 @@
-## 下载说明
+## 产物下载
 
-每个平台提供一个**便携 zip**（内含可执行程序 + 预设 + 背景）：
-- `handwrite-sim-windows-x86_64.zip`：Windows 版（内含 `handwrite-sim.exe`）
-- `handwrite-sim-linux-x86_64.zip`：Linux 版
-- `handwrite-sim-macos-arm64.zip`：macOS（Apple Silicon）版
+> 点击链接直接下载本版本对应文件，无需翻找页面底部 Assets。
 
-解压后即可使用（无需安装）：可执行文件 + `presets/` 预设 + `backgrounds/` 背景 + `fonts/` 字体目录。
-把 exe 放进任意目录，同目录下的资源目录即为便携根目录，整个文件夹可随意拷贝移动。
+- Windows 便携完整包 ([handwrite-sim-windows-x86_64.zip](https://github.com/bamboostrip/Handwriting-sim-rs/releases/download/{TAG}/handwrite-sim-windows-x86_64.zip))： 首次使用，解压即用（需系统 WebView2，Win10/11 通常自带）
+- Windows 单文件升级包 ([handwrite-sim-windows-x86_64.exe](https://github.com/bamboostrip/Handwriting-sim-rs/releases/download/{TAG}/handwrite-sim-windows-x86_64.exe))： 老用户下载后直接替换旧的 `handwrite-sim.exe` 即可
+- Windows 离线完整包 ([handwrite-sim-windows-x86_64-webview2.zip](https://github.com/bamboostrip/Handwriting-sim-rs/releases/download/{TAG}/handwrite-sim-windows-x86_64-webview2.zip))： 报 `WebView2 Runtime` 错误 / 内网离线 / 受限账户，内置运行时，解压即用免安装
+- Linux 便携完整包 ([handwrite-sim-linux-x86_64.zip](https://github.com/bamboostrip/Handwriting-sim-rs/releases/download/{TAG}/handwrite-sim-linux-x86_64.zip))： 需 WebKitGTK（见下方说明）；单文件升级 [handwrite-sim-linux-x86_64](https://github.com/bamboostrip/Handwriting-sim-rs/releases/download/{TAG}/handwrite-sim-linux-x86_64)，替换旧二进制后 `chmod +x`
+- macOS 便携完整包 ([handwrite-sim-macos-arm64.zip](https://github.com/bamboostrip/Handwriting-sim-rs/releases/download/{TAG}/handwrite-sim-macos-arm64.zip))： Apple Silicon（M1–M4）；单文件升级 [handwrite-sim-macos-arm64](https://github.com/bamboostrip/Handwriting-sim-rs/releases/download/{TAG}/handwrite-sim-macos-arm64)，直接替换旧二进制
 
-## 为什么没有字体？
+## 说明
 
-手写体字体多为商业版权字体（如汉呈、华阳、云江等字库），开源分发需要授权，
-因此本仓库与发布包均**不包含字体文件**。
-
-请自备字体放入 `fonts/` 目录，或从开源 / 免费可商用字体中下载：
-- 霞鹜文楷（LXGW WenKai）：OFL 1.1 协议，可商用，最接近手写体观感
-- 沐瑶随心手写体 / 站酷小薇 / 站酷快乐体：免费可商用
-
-预设中的字体路径（如 `fonts/云烟体.ttf`）为占位名称，
-放入对应字体文件后即可直接使用，也可以改用其他字体。
-
-## Linux 运行依赖
-
-Slint 界面需要 xcb/xkbcommon/fontconfig 运行时库（主流发行版默认已装）：
-```bash
-sudo apt install libxcb-shape0 libxcb-xfixes0 libxkbcommon0 libfontconfig1
-```
+- 便携包解压即用，整个文件夹可随意移动 / U 盘拷贝；离线版删除 `WebView2/` 目录即退化为轻量版（需系统 WebView2）。
+- 字体请自备：商业字体版权原因发布包不含字体，下载后放入 `fonts/` 即可，推荐免费可商用的霞鹜文楷（LXGW WenKai）。
+- Linux 需 WebKitGTK 运行库：`sudo apt install libwebkit2gtk-4.1-0 libayatana-appindicator3-1 librsvg2-2`

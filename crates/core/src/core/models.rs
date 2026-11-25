@@ -104,6 +104,12 @@ pub struct TextRegion {
     /// 区域内文字（支持多行）。
     #[serde(default)]
     pub text: String,
+    /// 绑定的角色 ID（0 为默认角色）。
+    #[serde(default)]
+    pub role_id: u32,
+    /// 绑定的高亮颜色名称（如 "yellow", "green", "cyan", "magenta", "pink", None = 无高亮）。
+    #[serde(default)]
+    pub highlight: Option<String>,
     /// 区域独立字体；空 = 使用主字体。
     #[serde(default)]
     pub font_path: String,
@@ -116,6 +122,9 @@ pub struct TextRegion {
     /// 所在页（1 基）；1 = 第一页。
     #[serde(default)]
     pub page: i32,
+    /// 所属表格序号（1 基；非表格区域为 None）。
+    #[serde(default)]
+    pub table_index: Option<u32>,
     /// 对齐方式：0 左 / 1 居中 / 2 右（应用于区域整体文本）。
     #[serde(default)]
     pub align: i32,
@@ -181,10 +190,13 @@ impl Default for TextRegion {
         Self {
             x: 0, y: 0, w: 0, h: 0,
             text: String::new(),
+            role_id: 0,
+            highlight: None,
             font_path: String::new(),
             printed: false,
             font_size: 0,
             page: 1,
+            table_index: None,
             align: 0,
             indent_em: 0.0,
             paragraphs: Vec::new(),
@@ -210,7 +222,9 @@ impl Default for TextRegion {
 impl TextRegion {
     /// 是否设置了任意一项逐区域覆盖（列表摘要标记用）。
     pub fn has_overrides(&self) -> bool {
-        self.word_spacing.is_some()
+        self.role_id != 0
+            || self.highlight.is_some()
+            || self.word_spacing.is_some()
             || self.line_spacing.is_some()
             || self.font_size_sigma.is_some()
             || self.word_spacing_sigma.is_some()
@@ -226,12 +240,15 @@ impl TextRegion {
             || self.margin_left.is_some_and(|v| v > 0.0)
             || self.margin_right.is_some_and(|v| v > 0.0)
     }
-    /// 区域列表里的一行摘要（对齐 Python 版 `TextRegion.label`）。
+    /// 区域列表里的一行摘要（对齐 Python 版 `TextRegion.label`；
+    /// 表格单元格区域前缀 表N· 标注归属，对齐前端 store.ts regionLabel）。
     pub fn label(&self, index: usize) -> String {
         let style = if self.printed { "打印" } else { "手写" };
         let page = if self.page > 1 { format!(" 第{}页", self.page) } else { String::new() };
+        let table = self.table_index.map_or_else(String::new, |n| format!("表{n}·"));
         format!(
-            "{}. {}{} {}字 ({},{} {}×{})",
+            "{}{}. {}{} {}字 ({},{} {}×{})",
+            table,
             index,
             style,
             page,
@@ -244,13 +261,90 @@ impl TextRegion {
     }
 }
 
+/// 单个文本片段（TextRun）的独立样式与角色配置。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TextRunStyle {
+    /// 角色 ID（0 为默认角色）。
+    #[serde(default)]
+    pub role_id: u32,
+    /// 高亮颜色名称（如 "yellow", "cyan", "pink", None = 无高亮）。
+    #[serde(default)]
+    pub highlight: Option<String>,
+    /// 字体文件路径覆盖（None = 跟随角色或主配置）。
+    #[serde(default)]
+    pub font_path: Option<String>,
+    /// 字体名称 / 族名（从 docx 等导入时捕获的字体名，如 "仿宋_GB2312"）。
+    #[serde(default)]
+    pub font_family: Option<String>,
+    /// 字号覆盖（None = 跟随角色或主配置）。
+    #[serde(default)]
+    pub font_size: Option<f32>,
+    /// 颜色覆盖（None = 跟随角色或主配置）。
+    #[serde(default)]
+    pub fill: Option<[u8; 3]>,
+    /// 是否为印刷体（默认 false）。
+    #[serde(default)]
+    pub printed: bool,
+}
+
+impl TextRunStyle {
+    pub fn with_role(role_id: u32) -> Self {
+        Self {
+            role_id,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_highlight(role_id: u32, highlight: impl Into<String>) -> Self {
+        Self {
+            role_id,
+            highlight: Some(highlight.into()),
+            ..Default::default()
+        }
+    }
+}
+
+/// 富文本段落内的一个文本片段。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TextRun {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub style: TextRunStyle,
+}
+
+impl TextRun {
+    pub fn new(text: impl Into<String>, style: TextRunStyle) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: TextRunStyle::default(),
+        }
+    }
+}
+
 /// 单个段落的排版信息。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Paragraph {
+    #[serde(default)]
     pub text: String,
+    #[serde(default)]
     pub align: Align,
     /// 首行缩进（像素）。
+    #[serde(default)]
     pub first_line_indent: f32,
+    /// 段落关联字体（可选）。
+    #[serde(default)]
+    pub font_family: Option<String>,
+    /// 富文本分段（多样式 / 多角色混排）；非空时优先于 text。
+    #[serde(default)]
+    pub runs: Vec<TextRun>,
 }
 
 impl Default for Paragraph {
@@ -259,6 +353,73 @@ impl Default for Paragraph {
             text: String::new(),
             align: Align::Left,
             first_line_indent: 0.0,
+            font_family: None,
+            runs: Vec::new(),
+        }
+    }
+}
+
+impl Paragraph {
+    /// 获取实际生效的 TextRun 列表。
+    /// 若 `runs` 非空则返回 `runs` 的副本，否则回退为基于 `text` 和默认样式的单 run。
+    pub fn effective_runs(&self) -> Vec<TextRun> {
+        if !self.runs.is_empty() {
+            self.runs.clone()
+        } else {
+            vec![TextRun {
+                text: self.text.clone(),
+                style: TextRunStyle::default(),
+            }]
+        }
+    }
+}
+
+/// 手写角色（角色预设），用于多角色/多笔迹混排。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct HandwritingRole {
+    #[serde(default)]
+    pub id: u32,
+    #[serde(default)]
+    pub name: String,
+    /// 绑定的高亮颜色（用于 docx 导入时自动关联对应角色）。
+    #[serde(default)]
+    pub highlight: Option<String>,
+    #[serde(default)]
+    pub font_path: String,
+    #[serde(default)]
+    pub printed: bool,
+    #[serde(default)]
+    pub font_size: Option<f32>,
+    #[serde(default)]
+    pub fill: Option<[u8; 3]>,
+    #[serde(default)]
+    pub word_spacing: Option<f32>,
+    #[serde(default)]
+    pub line_spacing: Option<f32>,
+    #[serde(default)]
+    pub font_size_sigma: Option<f32>,
+    #[serde(default)]
+    pub word_spacing_sigma: Option<f32>,
+    #[serde(default)]
+    pub line_spacing_sigma: Option<f32>,
+    #[serde(default)]
+    pub perturb_x_sigma: Option<f32>,
+    #[serde(default)]
+    pub perturb_y_sigma: Option<f32>,
+    #[serde(default)]
+    pub perturb_theta_sigma: Option<f32>,
+    #[serde(default)]
+    pub miswrite_rate: Option<f32>,
+    #[serde(default)]
+    pub miswrite_strikeout_style: Option<StrikeoutStyle>,
+}
+
+impl HandwritingRole {
+    pub fn new(id: u32, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            ..Default::default()
         }
     }
 }
@@ -288,6 +449,10 @@ pub enum ParamsError {
     RegionFontMissing { index: usize, path: String },
     #[error("文字区域 {index} 的字号不能为负")]
     RegionFontSize { index: usize },
+    #[error("角色 {index} 的字体文件不存在：{path}")]
+    RoleFontMissing { index: usize, path: String },
+    #[error("角色 {index} 的错字率必须在 0~1 之间：{value}")]
+    RoleMiswriteRate { index: usize, value: f32 },
     #[error("{name} 不能为负")]
     Negative { name: &'static str },
     #[error("颜色分量必须在 0-255 之间：{value}")]
@@ -331,6 +496,9 @@ pub struct HandwritingParams {
     /// 非空时在框选矩形内渲染区域文字（可与主文字并存）。
     #[serde(default)]
     pub regions: Vec<TextRegion>,
+    /// 多角色定义（用于不同段落或 TextRun 绑定不同角色）。
+    #[serde(default)]
+    pub roles: Vec<HandwritingRole>,
 
     // ---- 字体颜色 (RGB) ----
     pub fill: [u8; 3],
@@ -379,6 +547,7 @@ impl Default for HandwritingParams {
             text: String::new(),
             paragraphs: Vec::new(),
             regions: Vec::new(),
+            roles: Vec::new(),
             fill: [0, 0, 0],
             font_size: 36.0,
             word_spacing: 5.0,
@@ -413,8 +582,11 @@ impl HandwritingParams {
     /// 对齐 Python 版 `HandwritingParams.validate(require_text=...)`。
     pub fn validate_with(&self, require_text: bool) -> Result<(), ParamsError> {
         let has_region_text = self.regions.iter().any(|r| !r.text.trim().is_empty());
+        let has_para_text = self.paragraphs.iter().any(|p| {
+            !p.text.trim().is_empty() || p.runs.iter().any(|r| !r.text.trim().is_empty())
+        });
         let has_content =
-            !self.text.trim().is_empty() || !self.paragraphs.is_empty() || has_region_text;
+            !self.text.trim().is_empty() || has_para_text || has_region_text;
         if require_text && !has_content {
             return Err(ParamsError::NoText);
         }
@@ -455,39 +627,53 @@ impl HandwritingParams {
             ("perturb_y_sigma", self.perturb_y_sigma),
             ("perturb_theta_sigma", self.perturb_theta_sigma),
         ] {
-        if value < 0.0 {
-            return Err(ParamsError::Negative { name });
+            if value < 0.0 {
+                return Err(ParamsError::Negative { name });
+            }
         }
+        if self.total_line_spacing() <= 0.0 {
+            return Err(ParamsError::NoLineSpacing);
+        }
+        if !(0.0..=1.0).contains(&self.miswrite_rate) {
+            return Err(ParamsError::MiswriteRate { value: self.miswrite_rate });
+        }
+        for (i, role) in self.roles.iter().enumerate() {
+            let index = i + 1;
+            if !role.font_path.is_empty() && !std::path::Path::new(&role.font_path).is_file() {
+                return Err(ParamsError::RoleFontMissing {
+                    index,
+                    path: role.font_path.clone(),
+                });
+            }
+            if let Some(rate) = role.miswrite_rate {
+                if !(0.0..=1.0).contains(&rate) {
+                    return Err(ParamsError::RoleMiswriteRate { index, value: rate });
+                }
+            }
+        }
+        for (i, region) in self.regions.iter().enumerate() {
+            let index = i + 1;
+            if region.w <= 0 || region.h <= 0 {
+                return Err(ParamsError::RegionSize { index });
+            }
+            if region.x < 0 || region.y < 0 {
+                return Err(ParamsError::RegionPosition { index });
+            }
+            if region.page < 1 {
+                return Err(ParamsError::RegionPage { index });
+            }
+            if !region.font_path.is_empty() && !std::path::Path::new(&region.font_path).is_file() {
+                return Err(ParamsError::RegionFontMissing {
+                    index,
+                    path: region.font_path.clone(),
+                });
+            }
+            if region.font_size < 0 {
+                return Err(ParamsError::RegionFontSize { index });
+            }
+        }
+        Ok(())
     }
-    if self.total_line_spacing() <= 0.0 {
-        return Err(ParamsError::NoLineSpacing);
-    }
-    if !(0.0..=1.0).contains(&self.miswrite_rate) {
-        return Err(ParamsError::MiswriteRate { value: self.miswrite_rate });
-    }
-    for (i, region) in self.regions.iter().enumerate() {
-        let index = i + 1;
-        if region.w <= 0 || region.h <= 0 {
-            return Err(ParamsError::RegionSize { index });
-        }
-        if region.x < 0 || region.y < 0 {
-            return Err(ParamsError::RegionPosition { index });
-        }
-        if region.page < 1 {
-            return Err(ParamsError::RegionPage { index });
-        }
-        if !region.font_path.is_empty() && !std::path::Path::new(&region.font_path).is_file() {
-            return Err(ParamsError::RegionFontMissing {
-                index,
-                path: region.font_path.clone(),
-            });
-        }
-        if region.font_size < 0 {
-            return Err(ParamsError::RegionFontSize { index });
-        }
-    }
-    Ok(())
-}
 
     /// 行距含字高（与 Python 版 `total_line_spacing` 语义一致）。
     pub fn total_line_spacing(&self) -> f32 {
@@ -513,6 +699,7 @@ mod tests {
         assert_eq!(p.perturb_theta_sigma, 0.05);
         assert_eq!(p.fill, [0, 0, 0]);
         assert_eq!(p.end_chars, "，。");
+        assert!(p.roles.is_empty());
     }
 
     #[test]
@@ -591,5 +778,223 @@ mod tests {
         assert_eq!(StrikeoutStyle::parse("slash").unwrap(), StrikeoutStyle::Slash);
         assert_eq!(StrikeoutStyle::parse("cross").unwrap(), StrikeoutStyle::Cross);
         assert!(StrikeoutStyle::parse("invalid").is_err());
+    }
+
+    #[test]
+    fn test_text_run_and_style_serde_roundtrip() {
+        let style = TextRunStyle {
+            role_id: 2,
+            highlight: Some("yellow".into()),
+            font_path: Some("custom/font.ttf".into()),
+            font_family: Some("仿宋_GB2312".into()),
+            font_size: Some(28.0),
+            fill: Some([255, 0, 0]),
+            printed: true,
+        };
+        let run = TextRun::new("测试片段", style.clone());
+
+        let json = serde_json::to_string(&run).unwrap();
+        let deserialized: TextRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, run);
+        assert_eq!(deserialized.text, "测试片段");
+        assert_eq!(deserialized.style.role_id, 2);
+        assert_eq!(deserialized.style.highlight, Some("yellow".into()));
+        assert_eq!(deserialized.style.font_path, Some("custom/font.ttf".into()));
+        assert_eq!(deserialized.style.font_family, Some("仿宋_GB2312".into()));
+        assert_eq!(deserialized.style.font_size, Some(28.0));
+        assert_eq!(deserialized.style.fill, Some([255, 0, 0]));
+        assert!(deserialized.style.printed);
+
+        // Test default deserialization from minimal json
+        let minimal_json = r#"{"text":"简单文本"}"#;
+        let minimal_run: TextRun = serde_json::from_str(minimal_json).unwrap();
+        assert_eq!(minimal_run.text, "简单文本");
+        assert_eq!(minimal_run.style, TextRunStyle::default());
+        assert_eq!(minimal_run.style.role_id, 0);
+        assert_eq!(minimal_run.style.highlight, None);
+        assert_eq!(minimal_run.style.font_family, None);
+        assert!(!minimal_run.style.printed);
+    }
+
+    #[test]
+    fn test_paragraph_effective_runs() {
+        // 1. Legacy paragraph with only `text` and empty `runs`
+        let legacy_para = Paragraph {
+            text: "传统单段落内容".into(),
+            align: Align::Left,
+            first_line_indent: 20.0,
+            font_family: None,
+            runs: Vec::new(),
+        };
+        let effective = legacy_para.effective_runs();
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].text, "传统单段落内容");
+        assert_eq!(effective[0].style, TextRunStyle::default());
+
+        // 2. Paragraph with rich runs
+        let rich_para = Paragraph {
+            text: String::new(),
+            align: Align::Center,
+            first_line_indent: 0.0,
+            font_family: None,
+            runs: vec![
+                TextRun::new("角色A手写", TextRunStyle { role_id: 1, ..Default::default() }),
+                TextRun::new("印刷体提示", TextRunStyle { printed: true, ..Default::default() }),
+            ],
+        };
+        let effective_rich = rich_para.effective_runs();
+        assert_eq!(effective_rich.len(), 2);
+        assert_eq!(effective_rich[0].text, "角色A手写");
+        assert_eq!(effective_rich[0].style.role_id, 1);
+        assert_eq!(effective_rich[1].text, "印刷体提示");
+        assert!(effective_rich[1].style.printed);
+
+        // 3. Deserialization of legacy JSON without `runs` field
+        let legacy_json = r#"{"text":"反序列化传统段落","align":"Center","first_line_indent":10.0}"#;
+        let parsed_para: Paragraph = serde_json::from_str(legacy_json).unwrap();
+        assert!(parsed_para.runs.is_empty());
+        let runs = parsed_para.effective_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "反序列化传统段落");
+    }
+
+    #[test]
+    fn test_handwriting_role_serde_and_defaults() {
+        let role_default = HandwritingRole::default();
+        assert_eq!(role_default.id, 0);
+        assert_eq!(role_default.name, "");
+        assert_eq!(role_default.highlight, None);
+        assert_eq!(role_default.font_path, "");
+        assert!(!role_default.printed);
+        assert_eq!(role_default.font_size, None);
+        assert_eq!(role_default.fill, None);
+        assert_eq!(role_default.word_spacing, None);
+        assert_eq!(role_default.line_spacing, None);
+        assert_eq!(role_default.miswrite_rate, None);
+        assert_eq!(role_default.miswrite_strikeout_style, None);
+
+        let custom_role = HandwritingRole {
+            id: 1,
+            name: "批注老师".into(),
+            highlight: Some("yellow".into()),
+            font_path: "fonts/teacher.ttf".into(),
+            printed: false,
+            font_size: Some(30.0),
+            fill: Some([200, 0, 0]),
+            word_spacing: Some(6.0),
+            line_spacing: Some(50.0),
+            font_size_sigma: Some(1.5),
+            word_spacing_sigma: Some(1.0),
+            line_spacing_sigma: Some(1.0),
+            perturb_x_sigma: Some(1.0),
+            perturb_y_sigma: Some(1.0),
+            perturb_theta_sigma: Some(0.03),
+            miswrite_rate: Some(0.05),
+            miswrite_strikeout_style: Some(StrikeoutStyle::DoubleLine),
+        };
+
+        let json = serde_json::to_string(&custom_role).unwrap();
+        let deserialized: HandwritingRole = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, custom_role);
+
+        // Deserializing partial JSON
+        let partial_json = r#"{"id":3,"name":"学生A"}"#;
+        let partial_role: HandwritingRole = serde_json::from_str(partial_json).unwrap();
+        assert_eq!(partial_role.id, 3);
+        assert_eq!(partial_role.name, "学生A");
+        assert_eq!(partial_role.font_path, "");
+        assert_eq!(partial_role.font_size, None);
+    }
+
+    #[test]
+    fn text_region_table_index_defaults_none_for_legacy_json() {
+        // 旧版本保存的 JSON 无 table_index 字段：反序列化为 None（serde 向后兼容）
+        let legacy = r#"{"x":1,"y":2,"w":10,"h":5,"text":"答案","page":1}"#;
+        let r: TextRegion = serde_json::from_str(legacy).unwrap();
+        assert_eq!(r.table_index, None);
+        assert_eq!(TextRegion::default().table_index, None);
+
+        // 新字段写入后序列化往返保持
+        let r2 = TextRegion { table_index: Some(3), ..r.clone() };
+        let json = serde_json::to_string(&r2).unwrap();
+        let back: TextRegion = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.table_index, Some(3));
+        assert_eq!(back, r2);
+    }
+
+    #[test]
+    fn text_region_label_table_prefix() {
+        // 表格单元格区域带 表N· 前缀（对齐 store.ts regionLabel），普通区域无前缀
+        let plain = TextRegion { text: "你好".into(), page: 2, ..TextRegion::default() };
+        assert_eq!(plain.label(1), "1. 手写 第2页 2字 (0,0 0×0)");
+        let cell = TextRegion { text: "答案".into(), table_index: Some(2), ..TextRegion::default() };
+        assert_eq!(cell.label(3), "表2·3. 手写 2字 (0,0 0×0)");
+    }
+
+    #[test]
+    fn test_handwriting_params_roles_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let font = dir.path().join("font.ttf");
+        let bg = dir.path().join("bg.png");
+        let role_font = dir.path().join("role_font.ttf");
+        std::fs::write(&font, b"dummy").unwrap();
+        std::fs::write(&bg, b"dummy").unwrap();
+        std::fs::write(&role_font, b"dummy").unwrap();
+
+        let mut base = HandwritingParams {
+            text: "多角色测试".into(),
+            font_path: font.to_string_lossy().into_owned(),
+            background_path: bg.to_string_lossy().into_owned(),
+            ..HandwritingParams::default()
+        };
+
+        // 1. Valid role with existing font and valid miswrite rate
+        base.roles = vec![HandwritingRole {
+            id: 1,
+            name: "角色1".into(),
+            font_path: role_font.to_string_lossy().into_owned(),
+            miswrite_rate: Some(0.1),
+            ..Default::default()
+        }];
+        assert!(base.validate().is_ok());
+
+        // 2. Role with non-existent font file
+        let mut invalid_font_params = base.clone();
+        invalid_font_params.roles[0].font_path = dir.path().join("nonexistent.ttf").to_string_lossy().into_owned();
+        assert!(matches!(
+            invalid_font_params.validate(),
+            Err(ParamsError::RoleFontMissing { index: 1, .. })
+        ));
+
+        // 3. Role with invalid miswrite rate
+        let mut invalid_rate_params = base.clone();
+        invalid_rate_params.roles[0].miswrite_rate = Some(1.5);
+        assert!(matches!(
+            invalid_rate_params.validate(),
+            Err(ParamsError::RoleMiswriteRate { index: 1, .. })
+        ));
+
+        let mut negative_rate_params = base.clone();
+        negative_rate_params.roles[0].miswrite_rate = Some(-0.01);
+        assert!(matches!(
+            negative_rate_params.validate(),
+            Err(ParamsError::RoleMiswriteRate { index: 1, .. })
+        ));
+
+        // 4. Content check with paragraph runs instead of base text
+        let run_content_params = HandwritingParams {
+            text: String::new(),
+            font_path: font.to_string_lossy().into_owned(),
+            background_path: bg.to_string_lossy().into_owned(),
+            paragraphs: vec![Paragraph {
+                text: String::new(),
+                align: Align::Left,
+                first_line_indent: 0.0,
+                font_family: None,
+                runs: vec![TextRun::new("片段内容", TextRunStyle::default())],
+            }],
+            ..HandwritingParams::default()
+        };
+        assert!(run_content_params.validate().is_ok());
     }
 }

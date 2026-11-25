@@ -2,7 +2,7 @@
 //! 区域属性对话框（模态）：布局样式对齐主界面右侧面板。
 //!
 //! 基础项——区域文字（含对齐/缩进/docx 导入工具行）/ 手写体·打印体 /
-//! 起始页 / 打印字体（仅打印体）/ 字号；
+//! 起始页 / 字体文件（手写·打印体均可覆盖，留空使用主字体）/ 字号；
 //! 折叠面板「排版与扰动覆盖」——字距/扰动/错字率/涂改方式/颜色逐区域自定义，
 //! 留空 = 跟随主设置；打印体下扰动类覆盖不生效（引擎强制规整）。
 //! 编辑作用于 store.dialogDraft 草稿，确定时统一写回。
@@ -23,13 +23,16 @@ import {
   useMessage,
 } from "naive-ui";
 import { api } from "../api";
+import FontPicker from "./FontPicker.vue";
 import RegionTextEditor from "./RegionTextEditor.vue";
 import {
+  applyFontToTable,
   cancelRegionDialog,
-  chooseRegionFont,
   cleanText,
   confirmRegionDialog,
+  getRoleBadgeInfo,
   importDocxToDraft,
+  isDarkActive,
   regionHasOverrides,
   store,
 } from "../store";
@@ -39,47 +42,119 @@ const message = useMessage();
 const advOpen = ref<string[]>([]);
 const curRowIndex = ref(0);
 
-// 每次打开对话框时折叠面板收起、重置聚焦行为第一行
+/** 对话框内文字的本地编辑状态：输入时只改这里，不碰全局 store，
+ *  避免每敲一个字母就让整个弹窗（含十几个 Naive 控件）重渲染
+ *  —— 真机 WebView2 下这就是输入后按钮全灭的卡死主因。确定时再写回草稿。 */
+const localParas = ref<UiParagraph[]>([]);
+/** 每次打开对话框强制重挂载编辑器，避免上次残留与 Vue/手写 DOM 失步 */
+const editorKey = ref(0);
+
+function snapshotDraftParas(): UiParagraph[] {
+  const src = store.dialogDraft?.paragraphs;
+  if (!src || src.length === 0) return [{ text: "", align: 0, indentEm: 0 }];
+  // 注意保留 runs：区域段落可能携带 docx 混合高亮的富文本 runs，后端渲染会用到；
+  // 编辑器内只改文字/对齐/缩进，runs 原样带回，确定时写回草稿。
+  return src.map((p) => ({
+    text: p.text ?? "",
+    align: p.align ?? 0,
+    indentEm: p.indentEm ?? 0,
+    runs: p.runs?.map((r) => ({ text: r.text, style: r.style ? { ...r.style } : undefined })),
+  }));
+}
+
+// 每次打开对话框时折叠面板收起、重置聚焦行为第一行，并快照文字到本地
 watch(
   () => store.dialogOpen,
   (open) => {
     if (open) {
       advOpen.value = [];
       curRowIndex.value = 0;
+      localParas.value = snapshotDraftParas();
+      editorKey.value++;
+    }
+  },
+);
+
+/** 外部写入草稿（如导入 docx）后同步到本地编辑态；输入时本地只改 localParas，不回写 draft，不会触发这里 */
+watch(
+  () => store.dialogDraft?.paragraphs,
+  (newParas) => {
+    if (!store.dialogOpen || !newParas || newParas.length === 0) return;
+    const sameLength = newParas.length === localParas.value.length;
+    let sameText = sameLength;
+    if (sameLength) {
+      for (let k = 0; k < newParas.length; k++) {
+        if ((newParas[k].text ?? "") !== (localParas.value[k]?.text ?? "")) {
+          sameText = false;
+          break;
+        }
+      }
+    }
+    if (!sameText) {
+      localParas.value = newParas.map((p) => ({
+        text: p.text ?? "",
+        align: p.align ?? 0,
+        indentEm: p.indentEm ?? 0,
+        runs: p.runs?.map((r) => ({ text: r.text, style: r.style ? { ...r.style } : undefined })),
+      }));
+      curRowIndex.value = 0;
     }
   },
 );
 
 const draft = computed(() => store.dialogDraft);
-const isPrinted = computed(() => draft.value?.printed ?? false);
 const isNew = computed(() => store.dialogTargetIndex < 0);
 
-const curPara = computed<UiParagraph | undefined>(
-  () => draft.value?.paragraphs?.[curRowIndex.value],
+const roleOptions = computed(() =>
+  store.roles.map((r) => {
+    const badge = getRoleBadgeInfo(r, isDarkActive());
+    return {
+      label: `${badge.icon} ${r.name}`,
+      value: r.id,
+    };
+  }),
 );
+
+const selectedRoleId = computed<number>({
+  get: () => draft.value?.roleId ?? (draft.value?.printed ? 1 : 0),
+  set: (val: number) => {
+    onRoleChange(val);
+  },
+});
+
+function onRoleChange(roleId: number): void {
+  if (!draft.value) return;
+  draft.value.roleId = roleId;
+  const role = store.roles.find((r) => r.id === roleId);
+  if (role) {
+    draft.value.printed = role.printed;
+    if (role.highlight) {
+      draft.value.highlight = role.highlight;
+    }
+  }
+}
+
+const curPara = computed<UiParagraph | undefined>(() => localParas.value?.[curRowIndex.value]);
 const currentAlign = computed(() => curPara.value?.align ?? 0);
 const currentIndent = computed(() => curPara.value?.indentEm ?? 0);
 
 const curRowStatus = computed(() => {
-  const len = draft.value?.paragraphs?.length ?? 0;
+  const len = localParas.value?.length ?? 0;
   if (len === 0) return "光标定位到行后可用上方按钮设置该行格式";
   const idx = Math.min(curRowIndex.value, len - 1);
-  const p = draft.value?.paragraphs?.[idx];
+  const p = localParas.value?.[idx];
   if (!p) return "光标定位到行后可用上方按钮设置该行格式";
   const alignName = ["左对齐", "居中", "右对齐"][p.align] ?? "左对齐";
   const indentTxt = (p.indentEm ?? 0) > 0 ? "，首行缩进 2 字" : "";
-  const text = cleanText(p.text).replace(/\n/g, "");
+  const text = cleanText(p.text ?? "").replace(/\n/g, "");
   const segTxt = text.trim() === "" ? "（空行）" : "";
   return `第 ${idx + 1} 行（${[...text].length} 字）：${alignName}${indentTxt}${segTxt}`;
 });
 
-/** 对齐 / 首行缩进：作用于当前聚焦行 */
+/** 对齐 / 首行缩进：作用于当前聚焦行（只改本地，确定时写回） */
 function setDraftAlign(align: number): void {
   if (curPara.value) {
     curPara.value.align = align as 0 | 1 | 2;
-  }
-  if (draft.value && draft.value.paragraphs) {
-    draft.value.align = draft.value.paragraphs[0]?.align ?? 0;
   }
 }
 
@@ -87,15 +162,19 @@ function toggleDraftIndent(): void {
   if (curPara.value) {
     curPara.value.indentEm = (curPara.value.indentEm ?? 0) > 0 ? 0 : 2;
   }
-  if (draft.value && draft.value.paragraphs) {
-    draft.value.indentEm = draft.value.paragraphs[0]?.indentEm ?? 0;
-  }
 }
 
+/** 编辑器输入：只更新本地，不碰 store.dialogDraft（避免每字重渲染整个弹窗） */
 function onUpdateParagraphs(paras: UiParagraph[]): void {
-  if (draft.value) {
-    draft.value.paragraphs = paras;
-    draft.value.text = paras.map((p) => p.text).join("\n");
+  localParas.value = paras;
+}
+
+/** 导入 docx 到本地编辑态（经 store 导入后同步回来） */
+async function onImportDocxToDraft(): Promise<void> {
+  await importDocxToDraft();
+  if (store.dialogOpen) {
+    localParas.value = snapshotDraftParas();
+    curRowIndex.value = 0;
   }
 }
 
@@ -129,10 +208,25 @@ const strikeoutOptions = [
   { label: "叉号", value: 3 },
 ];
 
-/** 确定前校验打印字体文件存在（对齐 Python 版字体检查，失败保持对话框打开） */
+/** 将当前草稿的字体与字号批量应用到同一张表格的全部单元格区域（不关闭对话框）。
+ *  仅表格单元格区域（tableIndex 非空）可见入口；字号取整对齐确定时的写回行为。 */
+function onApplyFontToTable(): void {
+  const d = draft.value;
+  if (!d || d.tableIndex == null) return;
+  applyFontToTable(d.tableIndex, d.fontPath.trim(), Math.round(d.fontSize ?? 0));
+  message.success(`已将字体应用到表格 ${d.tableIndex} 的全部单元格`);
+}
+
+/** 确定前校验区域字体文件存在（手写/打印体均校验；对齐 Python 版字体检查，失败保持对话框打开） */
 async function onConfirm(): Promise<void> {
-  const fontPath = draft.value?.fontPath.trim() ?? "";
-  if (isPrinted.value && fontPath !== "" && !(await api.pathExists(fontPath))) {
+  if (draft.value) {
+    draft.value.paragraphs = localParas.value.map((p) => ({ ...p }));
+    draft.value.text = localParas.value.map((p) => p.text ?? "").join("\n");
+    draft.value.align = localParas.value[0]?.align ?? 0;
+    draft.value.indentEm = localParas.value[0]?.indentEm ?? 0;
+  }
+  const fontPath = (draft.value?.fontPath ?? "").trim();
+  if (fontPath !== "" && !(await api.pathExists(fontPath))) {
     message.warning(`文字区域字体文件不存在：${fontPath}`);
     return;
   }
@@ -160,14 +254,14 @@ async function onConfirm(): Promise<void> {
         <NButton size="tiny" :type="currentIndent > 0 ? 'primary' : 'default'" @click="toggleDraftIndent()">
           {{ currentIndent > 0 ? "取消缩进" : "首行缩进" }}
         </NButton>
-        <NButton size="tiny" @click="importDocxToDraft()">导入 docx</NButton>
+        <NButton size="tiny" @click="onImportDocxToDraft()">导入 docx</NButton>
       </div>
 
       <div class="hint-line" style="margin: 2px 0 6px">{{ curRowStatus }}</div>
 
       <RegionTextEditor
-        v-if="draft.paragraphs"
-        :paragraphs="draft.paragraphs"
+        :key="editorKey"
+        :paragraphs="localParas"
         :cur-index="curRowIndex"
         placeholder="输入该区域内要生成的文字，支持多行；回车分段，上方按钮设置当前行对齐/缩进；留空则放弃该区域"
         @update:paragraphs="onUpdateParagraphs"
@@ -176,9 +270,33 @@ async function onConfirm(): Promise<void> {
 
       <!-- 基础参数：统一「标签列 + 控件列」网格 -->
       <div class="dlg-basic-grid">
+        <span class="field-label">绑定角色</span>
+        <div class="field-control">
+          <NSelect
+            :value="selectedRoleId"
+            size="small"
+            :options="roleOptions"
+            style="flex: 1"
+            placeholder="选择笔迹或打印角色"
+            @update:value="onRoleChange"
+          />
+        </div>
+
         <span class="field-label">样式</span>
         <div class="field-control">
-          <NRadioGroup v-model:value="draft.printed" size="small">
+          <NRadioGroup
+            v-model:value="draft.printed"
+            size="small"
+            @update:value="(printed: boolean) => {
+              if (draft) {
+                if (printed && draft.roleId === 0) {
+                  draft.roleId = 1;
+                } else if (!printed && draft.roleId === 1) {
+                  draft.roleId = 0;
+                }
+              }
+            }"
+          >
             <NRadioButton :value="false">手写体</NRadioButton>
             <NRadioButton :value="true">打印体</NRadioButton>
           </NRadioGroup>
@@ -202,16 +320,19 @@ async function onConfirm(): Promise<void> {
           <span class="hint-line" style="margin: 0; margin-left: 6px">仅在指定页渲染，超出框选范围的内容自然截断</span>
         </div>
 
-        <span class="field-label">打印字体</span>
+        <span class="field-label">字体文件</span>
         <div class="field-control">
-          <NInput
+          <FontPicker
             v-model:value="draft.fontPath"
-            size="small"
-            :disabled="!isPrinted"
             placeholder="留空使用主字体"
             style="flex: 1"
           />
-          <NButton size="small" :disabled="!isPrinted" @click="chooseRegionFont()">选择</NButton>
+          <NTooltip v-if="draft.tableIndex" trigger="hover" placement="top">
+            <template #trigger>
+              <NButton size="small" @click="onApplyFontToTable()">此字体应用到整张表格</NButton>
+            </template>
+            将该字体与字号批量应用到表格 {{ draft.tableIndex }} 的全部单元格区域（不影响文字内容与其他参数）
+          </NTooltip>
         </div>
       </div>
 

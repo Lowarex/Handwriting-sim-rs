@@ -1,5 +1,12 @@
 <script setup lang="ts">
-//! 预览区：contain-fit 显示当前页 + 框选文字区域（交互对齐 Python 版 PreviewLabel）。
+//! 预览区：contain-fit / 缩放平移显示当前页 + 框选文字区域（交互对齐 Python 版 PreviewLabel）。
+//!
+//! 缩放与平移：
+//! - 滚轮 / 触控板（Ctrl+滚轮同路径）以光标为中心缩放，范围 [适应窗口, 400%]
+//! - 中键拖拽，或非框选 / 非调整态时在图纸空白处左键拖拽平移（3px 阈值，单击语义不变）
+//! - 右下角缩放条：− / 适应 / 100% / +，百分比按绝对比例显示
+//! - 换页 / 换底图 / 底图尺寸变化 → 回到适应窗口；同页自动重渲染保留当前视口
+//! - 文字区域列表「🔍」经 store.previewFocusToken 请求聚焦到该区域
 //!
 //! 与 Python 版一致的行为：
 //! - 「框选文字」为翻页导航行的勾选式按钮；勾选后十字光标，拖出矩形松开弹对话框
@@ -11,12 +18,31 @@
 //! - 新建/调整阈值：拖动 <4 显示像素视为误触；resize 增量 <4 显示像素忽略
 //!
 //! 坐标链：区域存背景原始像素 → ×factor(=drawW/bgNatW) → 显示像素。
+//! 缩放/平移只改变 drawW（即 factor）与图纸位置，区域坐标语义与写回逻辑完全不变。
 
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { NButton, NTooltip } from "naive-ui";
+import QuickStart from "./QuickStart.vue";
+import ErrorBanner from "./ErrorBanner.vue";
+import {
+  MAX_ABS_SCALE,
+  clampView,
+  drawRect,
+  effectiveScale,
+  fitScale,
+  focusRectView,
+  makeFitView,
+  panBy,
+  percentOf,
+  zoomAt,
+  type ViewState,
+} from "../viewport";
 import {
   clampRect,
   cancelRegionEdit,
+  doRender,
+  hasContent,
+  jumpToRegion,
   nextPage,
   openEditRegionDialog,
   openNewRegionDialog,
@@ -45,7 +71,7 @@ onMounted(() => {
 });
 onBeforeUnmount(() => ro?.disconnect());
 
-// ---- contain-fit 几何 ----
+// ---- 当前页与视口几何 ----
 const currentPage = computed(() => store.previewPages[store.pageIndex]);
 const natW = computed(() => currentPage.value?.width ?? 0);
 const natH = computed(() => currentPage.value?.height ?? 0);
@@ -53,15 +79,15 @@ const hasPreview = computed(
   () => store.previewPages.length > 0 && natW.value > 0 && natH.value > 0,
 );
 
-const fit = computed(() => {
-  if (!hasPreview.value || cw.value <= 0 || chh.value <= 0) return 0;
-  return Math.min(cw.value / natW.value, chh.value / natH.value);
-});
-const draw = computed(() => {
-  const dw = natW.value * fit.value;
-  const dh = natH.value * fit.value;
-  return { x: (cw.value - dw) / 2, y: (chh.value - dh) / 2, w: dw, h: dh };
-});
+/** contain-fit 比例（「适应窗口」时的显示比例） */
+const fit = computed(() => fitScale(natW.value, natH.value, cw.value, chh.value));
+/** 视口状态：fit 模式跟随窗口，manual 模式保留用户缩放 */
+const view = ref<ViewState>(makeFitView());
+/** 当前实际显示比例（CSS 像素 / 底图像素） */
+const scale = computed(() => effectiveScale(view.value, fit.value));
+const draw = computed(() =>
+  drawRect(view.value, fit.value, natW.value, natH.value, cw.value, chh.value),
+);
 const drawStyle = computed(() => ({
   left: `${draw.value.x}px`,
   top: `${draw.value.y}px`,
@@ -69,9 +95,64 @@ const drawStyle = computed(() => ({
   height: `${draw.value.h}px`,
 }));
 
-/** 背景原始像素 → 显示像素 */
+/** 背景原始像素 → 显示像素（缩放 / 平移只改变这里） */
 const factor = computed(() =>
   store.bgNatW > 0 ? draw.value.w / store.bgNatW : 1,
+);
+
+const zoomPercent = computed(() => percentOf(view.value, fit.value));
+const atFit = computed(
+  () => view.value.mode === "fit" || scale.value <= fit.value + 1e-6,
+);
+const atMax = computed(() => scale.value >= MAX_ABS_SCALE - 1e-6);
+const atActual = computed(() => Math.abs(scale.value - 1) < 5e-3);
+/** 图纸超出视口才有平移余量：适应窗口时中键 / 空白拖拽不生效 */
+const canPan = computed(
+  () => draw.value.w > cw.value + 0.5 || draw.value.h > chh.value + 0.5,
+);
+
+/** 回到「适应窗口」 */
+function resetView(): void {
+  view.value = makeFitView();
+}
+/** 窗口尺寸变化后重新钳制：manual 保留比例，但不小于新的适应比例、不越界 */
+function normalizeView(): void {
+  if (view.value.mode === "fit" || !hasPreview.value) return;
+  view.value = clampView(
+    view.value,
+    fit.value,
+    natW.value,
+    natH.value,
+    cw.value,
+    chh.value,
+  );
+}
+watch([cw, chh], normalizeView);
+watch([natW, natH], resetView);
+watch(() => store.pageIndex, resetView);
+watch(() => store.backgroundPath, resetView);
+
+/** 列表「🔍」请求聚焦：store 先切页再自增 token。
+ *  `flush: "post"` 保证在 pageIndex / natW 的 reset watcher 之后执行（不依赖 watcher 创建顺序）。 */
+watch(
+  () => store.previewFocusToken,
+  () => {
+    const r = store.regions[store.previewFocusIndex];
+    if (!r || !hasPreview.value || r.page - 1 !== store.pageIndex) return;
+    // 区域坐标存的是背景原始像素；预览图可能因 >4096 降采样而更小，
+    // 必须先换算到预览图像素，否则居中会按降采样比例偏移。
+    const kx = store.bgNatW > 0 ? natW.value / store.bgNatW : 1;
+    const ky = store.bgNatH > 0 ? natH.value / store.bgNatH : 1;
+    view.value = focusRectView(
+      { x: r.x * kx, y: r.y * ky, w: r.w * kx, h: r.h * ky },
+      natW.value,
+      natH.value,
+      cw.value,
+      chh.value,
+      36,
+    );
+  },
+  { flush: "post" },
 );
 
 const pageText = computed(() => {
@@ -98,6 +179,15 @@ const press = reactive({ x: 0, y: 0 });
 const hover = reactive({ x: -99, y: -99 });
 /** 橡皮筋实时几何（新建与编辑共用，显示像素） */
 const rb = reactive({ x: 0, y: 0, w: 0, h: 0 });
+
+// ---- 平移状态（累计位移基于按下时的视口，避免逐帧累积漂移） ----
+const panning = ref(false);
+const panStart = reactive({
+  clientX: 0,
+  clientY: 0,
+  moved: false,
+  view: makeFitView() as ViewState,
+});
 
 const hasEdit = computed(
   () => store.editingIndex >= 0 && store.editingIndex < store.regions.length,
@@ -151,13 +241,37 @@ const ZONE_CURSORS: Record<string, string> = {
   move: "move",
 };
 
+/** 命中当前页某个已有区域判定（返回索引，无则 -1） */
+function findRegionAt(px: number, py: number): number {
+  if (!hasPreview.value) return -1;
+  const f = factor.value;
+  for (let i = store.regions.length - 1; i >= 0; i--) {
+    const r = store.regions[i];
+    if (r.page - 1 !== store.pageIndex) continue;
+    const x = r.x * f;
+    const y = r.y * f;
+    const w = r.w * f;
+    const h = r.h * f;
+    if (px >= x && px <= x + w && py >= y && py <= y + h) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 const cursorStyle = computed(() => {
+  if (panning.value) return "grabbing";
   if (adjusting.value) return ZONE_CURSORS[zone.value] ?? "default";
   if (hasPreview.value && hasEdit.value) {
     const z = zoneAt(hover.x, hover.y);
     if (z !== "outside") return ZONE_CURSORS[z];
   }
   if (store.regionMode) return "crosshair";
+  if (hasPreview.value && findRegionAt(hover.x, hover.y) >= 0) {
+    return "pointer";
+  }
+  // 放大后空白处可拖拽平移（适应窗口时没有余量，不显示抓手）
+  if (hasPreview.value && !hasEdit.value && canPan.value) return "grab";
   return "default";
 });
 
@@ -173,6 +287,81 @@ function clampPt(p: { x: number; y: number }): { x: number; y: number } {
     y: Math.max(0, Math.min(p.y, draw.value.h)),
   };
 }
+
+// ---- 缩放与平移 ----
+/** 容器（preview-box）内坐标：缩放锚点必须相对容器，而不是会移动的图纸。
+ *  注意 preview-box 有 1px 边框：getBoundingClientRect 含边框，draw.x/y 以 padding box 为原点。 */
+function boxPoint(e: { clientX: number; clientY: number }): { x: number; y: number } {
+  const el = boxEl.value;
+  if (!el) return { x: cw.value / 2, y: chh.value / 2 };
+  const rect = el.getBoundingClientRect();
+  return {
+    x: e.clientX - rect.left - el.clientLeft,
+    y: e.clientY - rect.top - el.clientTop,
+  };
+}
+
+function zoomTo(nextScale: number, anchorX: number, anchorY: number): void {
+  if (!hasPreview.value) return;
+  view.value = zoomAt(
+    view.value,
+    fit.value,
+    natW.value,
+    natH.value,
+    cw.value,
+    chh.value,
+    anchorX,
+    anchorY,
+    nextScale,
+  );
+}
+
+function zoomIn(): void {
+  zoomTo(scale.value * 1.25, cw.value / 2, chh.value / 2);
+}
+
+function zoomOut(): void {
+  if (atFit.value) return;
+  const next = scale.value / 1.25;
+  if (next <= fit.value * 1.001) {
+    setFit();
+    return;
+  }
+  zoomTo(next, cw.value / 2, chh.value / 2);
+}
+
+function setFit(): void {
+  resetView();
+}
+
+function setActual(): void {
+  zoomTo(1, cw.value / 2, chh.value / 2);
+}
+
+/** 滚轮 / 触控板缩放：以光标为中心，指数步进；拖框或调整选框期间不改变视口 */
+function onWheel(e: WheelEvent): void {
+  if (!hasPreview.value) return;
+  e.preventDefault();
+  if (adjusting.value || rubberLive.value || panning.value) return;
+  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1;
+  const dy = e.deltaY * unit;
+  if (!dy) return;
+  const p = boxPoint(e);
+  zoomTo(scale.value * Math.exp(-dy * 0.0015), p.x, p.y);
+}
+
+function beginPan(e: PointerEvent): void {
+  // 调整 / 新建拖拽期间禁止另起平移（例如左键拖动选框时按中键），
+  // 否则几何映射会在拖动中途变化，写回坐标出错。
+  if (!hasPreview.value || !canPan.value || adjusting.value || rubberLive.value) return;
+  panning.value = true;
+  panStart.clientX = e.clientX;
+  panStart.clientY = e.clientY;
+  panStart.moved = false;
+  panStart.view = { ...view.value };
+  void interactEl.value?.setPointerCapture(e.pointerId);
+}
+
 function toSrcRect(r: { x: number; y: number; w: number; h: number }) {
   const f = factor.value;
   return { x: r.x / f, y: r.y / f, w: r.w / f, h: r.h / f };
@@ -187,38 +376,59 @@ function finishRect(display: {
   return clampRect(s.x, s.y, s.w, s.h, store.bgNatW, store.bgNatH);
 }
 
+// 记录调整开始时的基准矩形（防止重复读取中间态导致清零漂移）
+const startBox = reactive({ x: 0, y: 0, w: 0, h: 0 });
+
 function beginAdjust(z: Zone, p: { x: number; y: number }): void {
+  // 必须在 adjusting = true 之前从 ebBase 抓取当前真实矩形
+  const base = ebBase.value ?? { x: 0, y: 0, w: 0, h: 0 };
+  startBox.x = base.x;
+  startBox.y = base.y;
+  startBox.w = base.w;
+  startBox.h = base.h;
+
+  rb.x = base.x;
+  rb.y = base.y;
+  rb.w = base.w;
+  rb.h = base.h;
+
   adjusting.value = true;
   zone.value = z;
   const cp = clampPt(p);
   press.x = cp.x;
   press.y = cp.y;
-  const base = cur();
-  rb.x = base.x;
-  rb.y = base.y;
-  rb.w = base.w;
-  rb.h = base.h;
 }
 
 function onDown(e: PointerEvent): void {
-  if (e.button !== 0 || !hasPreview.value) return;
+  if (!hasPreview.value) return;
+
+  // 中键：任何模式下都用于平移（避免与左键的框选/移动/缩放语义冲突）
+  if (e.button === 1) {
+    e.preventDefault();
+    beginPan(e);
+    return;
+  }
+  if (e.button !== 0) return;
+
   e.preventDefault();
   void interactEl.value?.setPointerCapture(e.pointerId);
   const p = localPoint(e);
   hover.x = p.x;
   hover.y = p.y;
 
-  // 已有编辑框优先命中：抓取移动/缩放（即使处于新建模式，对齐 mousePressEvent）
+  // 1. 已有编辑框优先命中：抓取移动/缩放（即使处于新建模式，对齐 mousePressEvent）
   if (hasEdit.value) {
     const z = zoneAt(p.x, p.y);
     if (z !== "outside") {
       beginAdjust(z, p);
       return;
     }
+    // 点击编辑框外：结束当前调整态
+    cancelRegionEdit();
   }
+
+  // 2. 新建框选模式
   if (store.regionMode) {
-    // 新建框选拖拽；若处于编辑态先退出（对齐 finish_edit(emit=True)）
-    if (hasEdit.value) cancelRegionEdit();
     adjusting.value = false;
     zone.value = "outside";
     press.x = p.x;
@@ -230,10 +440,14 @@ function onDown(e: PointerEvent): void {
     rubberLive.value = true;
     return;
   }
-  if (hasEdit.value) {
-    // 非新建模式下点击框外：结束调整（emit=True）
-    cancelRegionEdit();
+
+  // 3. 普通模式下点击框外：命中当前页区域 → 选中切换；否则空白处可拖拽平移
+  const hit = findRegionAt(p.x, p.y);
+  if (hit >= 0) {
+    jumpToRegion(hit);
+    return;
   }
+  beginPan(e);
 }
 
 /** 新建橡皮筋是否可见（区别于编辑框复用同一几何容器） */
@@ -243,37 +457,57 @@ function applyAdjust(p: { x: number; y: number }): void {
   const cp = clampPt(p);
   const z = zone.value;
   if (z === "move") {
-    // 整体平移：钳制在图纸范围内
+    // 整体平移：基于 startBox 与鼠标位移计算，钳制在图纸范围内
     const dx = cp.x - press.x;
     const dy = cp.y - press.y;
-    rb.x = Math.max(0, Math.min(rb.x + dx, draw.value.w - rb.w));
-    rb.y = Math.max(0, Math.min(rb.y + dy, draw.value.h - rb.h));
-    press.x = cp.x;
-    press.y = cp.y;
+    rb.x = Math.max(0, Math.min(startBox.x + dx, draw.value.w - startBox.w));
+    rb.y = Math.max(0, Math.min(startBox.y + dy, draw.value.h - startBox.h));
+    rb.w = startBox.w;
+    rb.h = startBox.h;
     return;
   }
-  let l = rb.x;
-  let t = rb.y;
-  let r = rb.x + rb.w;
-  let b = rb.y + rb.h;
+
+  let l = startBox.x;
+  let t = startBox.y;
+  let r = startBox.x + startBox.w;
+  let b = startBox.y + startBox.h;
+
   if (z.includes("l")) l = cp.x;
   if (z.includes("r")) r = cp.x;
   if (z.includes("t")) t = cp.y;
   if (z.includes("b")) b = cp.y;
-  // 过小的增量直接忽略，保持上一几何（对齐 new.width() >= 4）
+
   const nx = Math.min(l, r);
   const ny = Math.min(t, b);
   const nw = Math.abs(r - l);
   const nh = Math.abs(b - t);
-  if (nw >= 4 && nh >= 4) {
-    rb.x = nx;
-    rb.y = ny;
-    rb.w = nw;
-    rb.h = nh;
-  }
+
+  // 保证最小显示尺寸 8px 并钳制在图纸范围内
+  rb.x = Math.max(0, Math.min(nx, draw.value.w - 8));
+  rb.y = Math.max(0, Math.min(ny, draw.value.h - 8));
+  rb.w = Math.max(8, Math.min(nw, draw.value.w - rb.x));
+  rb.h = Math.max(8, Math.min(nh, draw.value.h - rb.y));
 }
 
 function onMove(e: PointerEvent): void {
+  // 平移用 client 坐标累计：图纸自身在移动，localPoint 会随元素位移变化
+  if (panning.value) {
+    const dx = e.clientX - panStart.clientX;
+    const dy = e.clientY - panStart.clientY;
+    if (!panStart.moved && Math.hypot(dx, dy) < 3) return;
+    panStart.moved = true;
+    view.value = panBy(
+      panStart.view,
+      dx,
+      dy,
+      fit.value,
+      natW.value,
+      natH.value,
+      cw.value,
+      chh.value,
+    );
+    return;
+  }
   const p = localPoint(e);
   hover.x = p.x;
   hover.y = p.y;
@@ -290,6 +524,14 @@ function onMove(e: PointerEvent): void {
 }
 
 function onUp(e: PointerEvent): void {
+  if (panning.value) {
+    panning.value = false;
+    // 图纸已随平移移动：重新取一次局部坐标，恢复正确的光标形态
+    const p = localPoint(e);
+    hover.x = p.x;
+    hover.y = p.y;
+    return;
+  }
   const p = localPoint(e);
   if (adjusting.value) {
     const changed =
@@ -322,22 +564,23 @@ function onCancel(): void {
   adjusting.value = false;
   zone.value = "outside";
   rubberLive.value = false;
+  panning.value = false;
 }
 
 /** 双击区域 → 打开属性对话框（修改文字 / 参数）。命中当前页最上层包含点的区域。 */
 function onDblClick(e: MouseEvent): void {
   if (!hasPreview.value || store.dialogOpen) return;
   const p = localPoint(e);
-  const f = factor.value;
-  for (let i = store.regions.length - 1; i >= 0; i--) {
-    const r = store.regions[i];
-    if (r.page - 1 !== store.pageIndex) continue;
-    const x = r.x * f;
-    const y = r.y * f;
-    if (p.x >= x && p.x <= x + r.w * f && p.y >= y && p.y <= y + r.h * f) {
-      openEditRegionDialog(i);
-      return;
-    }
+  const hit = findRegionAt(p.x, p.y);
+  if (hit >= 0) {
+    openEditRegionDialog(hit);
+  }
+}
+
+/** 点击预览视口外侧空白灰色背景：退出区域调整态与选中态 */
+function onBoxDown(e: PointerEvent): void {
+  if (e.target === boxEl.value) {
+    cancelRegionEdit();
   }
 }
 
@@ -369,7 +612,14 @@ function pxStyle(r: { x: number; y: number; w: number; h: number }) {
 
 <template>
   <div class="preview-col">
-    <div ref="boxEl" class="preview-box" :style="{ background: boxBackground }">
+    <ErrorBanner />
+    <div
+      ref="boxEl"
+      class="preview-box"
+      :style="{ background: boxBackground }"
+      @pointerdown="onBoxDown"
+      @wheel="onWheel"
+    >
       <template v-if="hasPreview">
         <div class="draw-area" :style="drawStyle">
           <img class="page-img" :src="currentPage.url" alt="" />
@@ -404,8 +654,42 @@ function pxStyle(r: { x: number; y: number; w: number; h: number }) {
             @dblclick="onDblClick"
           />
         </div>
+
+        <!-- 右下角缩放条：滚轮以光标为中心缩放，中键或空白处拖拽平移 -->
+        <div class="zoom-bar" @pointerdown.stop @wheel.stop.prevent>
+          <NButton size="tiny" quaternary :disabled="atFit" title="缩小" @click="zoomOut">
+            −
+          </NButton>
+          <NButton
+            size="tiny"
+            quaternary
+            :type="atFit ? 'primary' : 'default'"
+            title="适应窗口"
+            @click="setFit"
+          >
+            适应
+          </NButton>
+          <NButton
+            size="tiny"
+            quaternary
+            :type="atActual ? 'primary' : 'default'"
+            title="预览图 1:1（100%）"
+            @click="setActual"
+          >
+            100%
+          </NButton>
+          <NButton size="tiny" quaternary :disabled="atMax" title="放大" @click="zoomIn">
+            +
+          </NButton>
+          <span class="zoom-percent" title="当前显示比例（CSS 像素 / 预览图像素）">
+            {{ zoomPercent }}%
+          </span>
+        </div>
       </template>
-      <div v-else class="empty-hint">选择字体与背景后点击「预览」开始生成手写体</div>
+      <QuickStart v-if="!hasContent()" />
+      <div v-else-if="!hasPreview" class="empty-hint">
+        {{ store.rendering ? "正在生成预览…" : "内容已就绪，点击下方「刷新」重试" }}
+      </div>
     </div>
 
     <div class="pagenav">
@@ -427,6 +711,7 @@ function pxStyle(r: { x: number; y: number; w: number; h: number }) {
         勾选后在预览图上按住鼠标拖出矩形，松开后输入该区域的文字<br />
         （可独立选择手写体 / 打印体，实现混排）
       </NTooltip>
+      <NButton size="small" :loading="store.rendering" @click="doRender()">↻ 刷新</NButton>
     </div>
   </div>
 </template>

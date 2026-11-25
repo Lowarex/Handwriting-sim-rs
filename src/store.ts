@@ -4,32 +4,380 @@
 //!
 //! 渲染代次守卫：renderSeq 只采纳最新一次请求结果，过期响应直接丢弃。
 
-import { reactive, watch } from "vue";
+import { nextTick, reactive, watch } from "vue";
 import { createDiscreteApi } from "naive-ui";
 import { useDebounceFn } from "@vueuse/core";
 import { api, assetUrl, dialogs } from "./api";
-import type { UiParams, UiRegion } from "./types";
+import type { SystemFontItem, UiHandwritingRole, UiParams, UiRegion, UiTextRun, UpdateInfo } from "./types";
+
+/** 当前版本号与开源仓库地址 */
+export const APP_VERSION = "0.6.0";
+
+export const PYTHON_REPO_URL = "https://github.com/bamboostrip/Handwriting-simulator";
+export const RUST_REPO_URL = "https://github.com/bamboostrip/Handwriting-sim-rs";
+
+const KEY_AUTO_CHECK = "handwritesim_auto_check";
+const KEY_SKIPPED_VERSION = "handwritesim_skipped_version";
+const KEY_THEME_PREFERENCE = "handwritesim_theme_preference";
+const KEY_PANEL_COLLAPSE = "handwritesim_panel_collapse_v2";
+const KEY_ONBOARDING_DONE = "handwritesim_onboarding_done";
+const KEY_CHECKLIST_DISMISSED = "handwritesim_checklist_dismissed";
+const KEY_HAS_EXPORTED = "handwritesim_has_exported";
+
+function readStoredBool(key: string, fallback = false): boolean {
+  try {
+    const v = localStorage.getItem(key);
+    return v === null ? fallback : v === "true";
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStoredBool(key: string, value: boolean): void {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch {
+    // localStorage 不可用时静默降级
+  }
+}
+
+export type ThemePreference = "auto" | "light" | "dark";
+
+export function getStoredThemePreference(): ThemePreference {
+  try {
+    const v = localStorage.getItem(KEY_THEME_PREFERENCE);
+    if (v === "light" || v === "dark" || v === "auto") return v;
+    return "auto";
+  } catch {
+    return "auto";
+  }
+}
+
+export function isAutoCheckEnabled(): boolean {
+  try {
+    const v = localStorage.getItem(KEY_AUTO_CHECK);
+    return v === null ? true : v === "true";
+  } catch {
+    return true;
+  }
+}
+
+export function getSkippedVersion(): string {
+  try {
+    return localStorage.getItem(KEY_SKIPPED_VERSION) || "";
+  } catch {
+    return "";
+  }
+}
+
+/** 右栏阶段分组的展开记录（true = 折叠）；无记录返回 null（首次使用） */
+export type PanelCollapseState = {
+  content: boolean;
+  style: boolean;
+  layout: boolean;
+  regions: boolean;
+};
+
+export function loadPanelCollapseState(): PanelCollapseState | null {
+  try {
+    const raw = localStorage.getItem(KEY_PANEL_COLLAPSE);
+    if (!raw) return null;
+    const v = JSON.parse(raw) as Partial<PanelCollapseState>;
+    return {
+      content: v.content ?? false,
+      style: v.style ?? true,
+      layout: v.layout ?? true,
+      regions: v.regions ?? true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function savePanelCollapseState(s: PanelCollapseState): void {
+  try {
+    localStorage.setItem(KEY_PANEL_COLLAPSE, JSON.stringify(s));
+  } catch {
+    // localStorage 不可用时静默降级为不记忆
+  }
+}
+
 
 /** 组件树外的离散弹窗（store 层的阻断性错误提示用） */
-const { dialog: appDialog } = createDiscreteApi(["dialog"]);
+const { dialog: appDialog, message: appMessage } = createDiscreteApi(["dialog", "message"]);
 
-// ---------------------------------------------------------------- 数据模型
+// ---------------------------------------------------------------- 数据模型与高亮角色定义
+
+export interface WordHighlightColor {
+  key: string;
+  name: string;
+  bg: string;
+  color: string;
+  darkBg: string;
+  darkColor: string;
+  icon: string;
+}
+
+export const WORD_HIGHLIGHT_MAP: Record<string, WordHighlightColor> = {
+  yellow: {
+    key: "yellow",
+    name: "黄色",
+    bg: "#fef08a",
+    color: "#713f12",
+    darkBg: "#713f12",
+    darkColor: "#fef08a",
+    icon: "🟨",
+  },
+  green: {
+    key: "green",
+    name: "绿色",
+    bg: "#bbf7d0",
+    color: "#14532d",
+    darkBg: "#14532d",
+    darkColor: "#bbf7d0",
+    icon: "🟩",
+  },
+  cyan: {
+    key: "cyan",
+    name: "青色",
+    bg: "#bae6fd",
+    color: "#0c4a6e",
+    darkBg: "#0c4a6e",
+    darkColor: "#bae6fd",
+    icon: "🟦",
+  },
+  magenta: {
+    key: "magenta",
+    name: "品红",
+    bg: "#fbcfe8",
+    color: "#831843",
+    darkBg: "#831843",
+    darkColor: "#fbcfe8",
+    icon: "🟪",
+  },
+  blue: {
+    key: "blue",
+    name: "蓝色",
+    bg: "#bfdbfe",
+    color: "#1e3a8a",
+    darkBg: "#1e3a8a",
+    darkColor: "#bfdbfe",
+    icon: "🟦",
+  },
+  red: {
+    key: "red",
+    name: "红色",
+    bg: "#fecaca",
+    color: "#7f1d1d",
+    darkBg: "#7f1d1d",
+    darkColor: "#fecaca",
+    icon: "🟥",
+  },
+  darkBlue: {
+    key: "darkBlue",
+    name: "深蓝",
+    bg: "#93c5fd",
+    color: "#172554",
+    darkBg: "#172554",
+    darkColor: "#93c5fd",
+    icon: "🟦",
+  },
+  darkCyan: {
+    key: "darkCyan",
+    name: "深青",
+    bg: "#67e8f9",
+    color: "#083344",
+    darkBg: "#083344",
+    darkColor: "#67e8f9",
+    icon: "🟦",
+  },
+  darkGreen: {
+    key: "darkGreen",
+    name: "深绿",
+    bg: "#86efac",
+    color: "#052e16",
+    darkBg: "#052e16",
+    darkColor: "#86efac",
+    icon: "🟩",
+  },
+  darkMagenta: {
+    key: "darkMagenta",
+    name: "深品红",
+    bg: "#f472b6",
+    color: "#500724",
+    darkBg: "#500724",
+    darkColor: "#f472b6",
+    icon: "🟪",
+  },
+  darkRed: {
+    key: "darkRed",
+    name: "深红",
+    bg: "#f87171",
+    color: "#450a0a",
+    darkBg: "#450a0a",
+    darkColor: "#f87171",
+    icon: "🟥",
+  },
+  darkYellow: {
+    key: "darkYellow",
+    name: "深黄",
+    bg: "#fde047",
+    color: "#422006",
+    darkBg: "#422006",
+    darkColor: "#fde047",
+    icon: "🟨",
+  },
+  lightGray: {
+    key: "lightGray",
+    name: "浅灰",
+    bg: "#e2e8f0",
+    color: "#334155",
+    darkBg: "#334155",
+    darkColor: "#e2e8f0",
+    icon: "⬛",
+  },
+  darkGray: {
+    key: "darkGray",
+    name: "深灰",
+    bg: "#94a3b8",
+    color: "#0f172a",
+    darkBg: "#0f172a",
+    darkColor: "#94a3b8",
+    icon: "⬛",
+  },
+  black: {
+    key: "black",
+    name: "黑色",
+    bg: "#334155",
+    color: "#ffffff",
+    darkBg: "#0f172a",
+    darkColor: "#f8fafc",
+    icon: "⬛",
+  },
+};
+
+/** 查找高亮信息（不区分大小写及下划线/连字符） */
+export function getHighlightInfo(key?: string | null): WordHighlightColor | null {
+  if (!key) return null;
+  const raw = key.trim();
+  if (WORD_HIGHLIGHT_MAP[raw]) return WORD_HIGHLIGHT_MAP[raw];
+  const norm = raw.toLowerCase().replace(/[-_\s]/g, "");
+  if (norm === "pink") return WORD_HIGHLIGHT_MAP.magenta;
+  if (norm === "gray" || norm === "grey") return WORD_HIGHLIGHT_MAP.lightGray;
+  for (const k of Object.keys(WORD_HIGHLIGHT_MAP)) {
+    if (k.toLowerCase() === norm) return WORD_HIGHLIGHT_MAP[k];
+  }
+  return null;
+}
+
+/** 获取角色的徽章样式信息（背景色、文本色、图标、名称） */
+export function getRoleBadgeInfo(role: UiHandwritingRole, isDark = isDarkActive()) {
+  if (role.id === 0) {
+    return {
+      label: "主字体",
+      icon: "🖊️",
+      color: isDark ? "#94a3b8" : "#64748b",
+      bg: isDark ? "rgba(148, 163, 184, 0.18)" : "rgba(100, 116, 139, 0.12)",
+      highlightName: "主字体",
+    };
+  }
+  if (role.id === 1 || role.printed) {
+    const hl = getHighlightInfo(role.highlight) || WORD_HIGHLIGHT_MAP.lightGray;
+    return {
+      label: role.name || "打印体",
+      icon: "🖨️",
+      color: isDark ? hl.darkColor : hl.color,
+      bg: isDark ? hl.darkBg : hl.bg,
+      highlightName: hl.name,
+    };
+  }
+
+  // 1. 若角色指定了显式高亮
+  const hl = getHighlightInfo(role.highlight);
+  if (hl) {
+    return {
+      label: role.name,
+      icon: hl.icon,
+      color: isDark ? hl.darkColor : hl.color,
+      bg: isDark ? hl.darkBg : hl.bg,
+      highlightName: hl.name,
+    };
+  }
+
+  // 2. 预设默认角色 ID (2:黄, 3:绿, 4:青, 5:品红)
+  if (role.id === 2) {
+    const y = WORD_HIGHLIGHT_MAP.yellow;
+    return { label: role.name, icon: y.icon, color: isDark ? y.darkColor : y.color, bg: isDark ? y.darkBg : y.bg, highlightName: y.name };
+  }
+  if (role.id === 3) {
+    const g = WORD_HIGHLIGHT_MAP.green;
+    return { label: role.name, icon: g.icon, color: isDark ? g.darkColor : g.color, bg: isDark ? g.darkBg : g.bg, highlightName: g.name };
+  }
+  if (role.id === 4) {
+    const c = WORD_HIGHLIGHT_MAP.cyan;
+    return { label: role.name, icon: c.icon, color: isDark ? c.darkColor : c.color, bg: isDark ? c.darkBg : c.bg, highlightName: c.name };
+  }
+  if (role.id === 5) {
+    const m = WORD_HIGHLIGHT_MAP.magenta;
+    return { label: role.name, icon: m.icon, color: isDark ? m.darkColor : m.color, bg: isDark ? m.darkBg : m.bg, highlightName: m.name };
+  }
+
+  // 3. 若角色配置了专属墨水颜色
+  if (role.fill) {
+    return {
+      label: role.name,
+      icon: "🎨",
+      color: role.fill,
+      bg: isDark ? `${role.fill}44` : `${role.fill}1a`,
+      highlightName: `墨水 ${role.fill}`,
+    };
+  }
+
+  // 4. 其余角色的循环调色板
+  const palette = [
+    { name: "紫色", bg: "#f3e8ff", color: "#6b21a8", darkBg: "#581c87", darkColor: "#f3e8ff", icon: "🟣" },
+    { name: "橙色", bg: "#ffedd5", color: "#9a3412", darkBg: "#7c2d12", darkColor: "#ffedd5", icon: "🟠" },
+    { name: "粉红", bg: "#ffe4e6", color: "#9f1239", darkBg: "#881337", darkColor: "#ffe4e6", icon: "🌸" },
+    { name: "青绿", bg: "#ccfbf1", color: "#115e59", darkBg: "#134e4a", darkColor: "#ccfbf1", icon: "🟢" },
+    { name: "靛蓝", bg: "#e0e7ff", color: "#3730a3", darkBg: "#312e81", darkColor: "#e0e7ff", icon: "🔵" },
+  ];
+  const p = palette[(role.id - 6 + palette.length) % palette.length];
+  return {
+    label: role.name,
+    icon: p.icon,
+    color: isDark ? p.darkColor : p.color,
+    bg: isDark ? p.darkBg : p.bg,
+    highlightName: p.name,
+  };
+}
 
 export interface Para {
   id: number;
   text: string;
   align: 0 | 1 | 2;
   indentEm: number;
+  runs?: UiTextRun[];
 }
 
 export type Region = UiRegion;
 
+export const defaultRoles = (): UiHandwritingRole[] => [
+  { id: 0, name: "默认手写 (主字体)", fontPath: "", printed: false, fill: null },
+  { id: 1, name: "打印体 (无扰动)", fontPath: "", printed: true, fill: null },
+];
+
 let paraSeq = 1;
-export const newPara = (text = "", align: 0 | 1 | 2 = 0, indentEm = 0): Para => ({
+export const newPara = (
+  text = "",
+  align: 0 | 1 | 2 = 0,
+  indentEm = 0,
+  runs?: UiTextRun[],
+): Para => ({
   id: paraSeq++,
   text,
   align,
   indentEm,
+  runs,
 });
 
 /** 清理外来文本特殊字符（对齐后端 clean_text / 原 to_ui_spaces） */
@@ -39,6 +387,9 @@ export const cleanText = (s: string): string =>
 const PREVIEW_BG_COLORS = ["#c8d0ca", "#565b56"];
 
 export const store = reactive({
+  // ---- 系统字体缓存 ----
+  systemFonts: [] as SystemFontItem[],
+
   // ---- 参数表单（与 Slint 版控件一一对应）----
   fontPath: "",
   backgroundPath: "",
@@ -64,10 +415,15 @@ export const store = reactive({
   endChars: "，。",
   startChars: "",
 
+  // ---- 笔迹角色 ----
+  roles: defaultRoles(),
+
   // ---- 逐段编辑器 ----
   paragraphs: [newPara()] as Para[],
   curParaId: null as number | null,
   paraStatus: "光标定位到段落后可用按钮设置格式",
+  /** 编辑器内存在非折叠文字选区（驱动右栏「选区角色」标记条按需显示） */
+  hasTextSelection: false,
 
   // ---- 框选文字区域 ----
   regionMode: false,
@@ -90,13 +446,486 @@ export const store = reactive({
   previewPages: [] as { url: string; width: number; height: number }[],
   pageIndex: 0,
   previewBgIdx: 0,
+  /** 列表「🔍」请求聚焦的区域索引（-1 = 无）；token 自增驱动预览组件应用 */
+  previewFocusIndex: -1,
+  previewFocusToken: 0,
   bgNatW: 0,
   bgNatH: 0,
   rendering: false,
   status: "就绪",
 
   presets: [] as { name: string; path: string }[],
+
+  // ---- 当前方案（预设 / 字体 / 纸张）----
+  currentPresetPath: "",
+  currentPresetName: "",
+  presetDirty: false,
+  /** 预设资产缺失等非阻断提示，显示在「当前方案」卡片里 */
+  presetNotice: "",
+  /** 自动兜底选中的系统字体路径（用于提示「已自动使用系统字体」） */
+  autoFontPath: "",
+
+  // ---- 新手引导 / 首屏状态 ----
+  onboardingOpen: false,
+  onboardingDone: readStoredBool(KEY_ONBOARDING_DONE),
+  checklistDismissed: readStoredBool(KEY_CHECKLIST_DISMISSED),
+  hasExported: readStoredBool(KEY_HAS_EXPORTED),
+  textEditorOpen: false,
+
+  // ---- 可恢复的错误（替代只在状态栏里报错）----
+  errorBanner: "",
+  errorKind: "" as "" | "font" | "background" | "other",
+  errorSource: "" as "" | "render" | "export" | "preset",
+
+  // ---- 关于与版本更新 ----
+  aboutModalOpen: false,
+  helpModalOpen: false,
+  helpTab: "quickstart",
+  updateModalOpen: false,
+  updateInfo: null as UpdateInfo | null,
+  checkingUpdate: false,
+  updateStatusText: "点击右侧按钮可主动联网检测最新版本",
+  autoCheckUpdate: isAutoCheckEnabled(),
+  skippedVersion: getSkippedVersion(),
+
+  // ---- 主题模式 ----
+  themePreference: getStoredThemePreference(),
+  systemIsDark: typeof window !== "undefined" && window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)").matches : false,
 });
+
+/** 当前是否实际生效深色模式 */
+export function isDarkActive(): boolean {
+  if (store.themePreference === "dark") return true;
+  if (store.themePreference === "light") return false;
+  return store.systemIsDark;
+}
+
+/** 设置主题偏好（'auto' | 'light' | 'dark'）并持久化 */
+export function setThemePreference(pref: ThemePreference): void {
+  store.themePreference = pref;
+  try {
+    localStorage.setItem(KEY_THEME_PREFERENCE, pref);
+  } catch (e) {
+    console.error("保存主题配置失败:", e);
+  }
+  syncThemeClass();
+}
+
+/** 循环切换主题偏好：自动跟随系统 ➔ 浅色模式 ➔ 深色模式 ➔ 自动跟随系统 */
+export function cycleThemePreference(): void {
+  if (store.themePreference === "auto") {
+    setThemePreference("light");
+  } else if (store.themePreference === "light") {
+    setThemePreference("dark");
+  } else {
+    setThemePreference("auto");
+  }
+}
+
+/** 兼容旧的 toggleTheme 调用 */
+export const toggleTheme = cycleThemePreference;
+
+/** 同步 html/body 的 dark 类与 data-theme 属性 */
+export function syncThemeClass(): void {
+  if (typeof document !== "undefined") {
+    const dark = isDarkActive();
+    if (dark) {
+      document.documentElement.classList.add("dark");
+      document.documentElement.setAttribute("data-theme", "dark");
+    } else {
+      document.documentElement.classList.remove("dark");
+      document.documentElement.setAttribute("data-theme", "light");
+    }
+  }
+}
+
+/** 初始化主题系统（注册 matchMedia 与 Tauri 原生系统主题变化监听） */
+export function initThemeSystem(): void {
+  // 1. Web mediaQuery 监听（支持现代 addEventListener 与旧版 addListener）
+  if (typeof window !== "undefined" && window.matchMedia) {
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    store.systemIsDark = mq.matches;
+
+    const handler = (e: MediaQueryListEvent | { matches: boolean }) => {
+      store.systemIsDark = e.matches;
+      if (store.themePreference === "auto") {
+        syncThemeClass();
+      }
+    };
+
+    if (mq.addEventListener) {
+      mq.addEventListener("change", handler);
+    } else if ((mq as any).addListener) {
+      (mq as any).addListener(handler);
+    }
+  }
+
+  // 2. Tauri 原生 OS 主题变化监听（Windows / macOS / Linux）
+  try {
+    api.getSystemTheme()
+      .then((theme) => {
+        store.systemIsDark = theme === "dark";
+        syncThemeClass();
+      })
+      .catch(() => {});
+
+    api.onSystemThemeChanged((theme) => {
+      store.systemIsDark = theme === "dark";
+      if (store.themePreference === "auto") {
+        syncThemeClass();
+      }
+    });
+  } catch (e) {
+    // 纯网页调试环境兼容
+  }
+
+  syncThemeClass();
+}
+
+// 模块加载时立即初始化一次
+initThemeSystem();
+
+
+// ---------------------------------------------------------------- 首次使用与当前方案
+
+/** 取路径中的文件名（兼容 Windows 反斜杠）。 */
+export function fileName(path: string): string {
+  const s = path.replace(/\\/g, "/");
+  const i = s.lastIndexOf("/");
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+
+/** 以目录原始分隔符拼接路径（Windows 用 \，Unix 用 /）。 */
+function joinFsPath(dir: string, ...parts: string[]): string {
+  const sep = dir.includes("\\") ? "\\" : "/";
+  return [dir.replace(/[\\/]+$/, ""), ...parts].join(sep);
+}
+
+/** 当前字体的人类可读名称（系统字体用名称，本地字体用文件名）。 */
+export function currentFontLabel(): string {
+  const p = store.fontPath.trim();
+  if (!p) return "未选择字体";
+  const found = store.systemFonts.find((f) => f.path === p);
+  return found ? found.name : fileName(p);
+}
+
+export function currentBackgroundLabel(): string {
+  if ((store.docPages?.length ?? 0) > 0) return `文档底图 ${store.docPages!.length} 页`;
+  const p = store.backgroundPath.trim();
+  return p ? fileName(p) : "未选择纸张";
+}
+
+export function hasTextContent(): boolean {
+  return store.paragraphs.some(
+    (p) =>
+      cleanText(p.text).trim() !== "" ||
+      (p.runs?.some((run) => cleanText(run.text).trim() !== "") ?? false),
+  );
+}
+
+export function hasContent(): boolean {
+  return (
+    hasTextContent() ||
+    (store.docPages?.length ?? 0) > 0 ||
+    store.regions.some((r) => r.text.trim() !== "")
+  );
+}
+
+export type WorkflowMode = "empty" | "text" | "document";
+
+/** 当前处于哪种工作流：空 / 纯文字 / 文档填空。 */
+export function workflowMode(): WorkflowMode {
+  if ((store.docPages?.length ?? 0) > 0) return "document";
+  return hasTextContent() || store.regions.length > 0 ? "text" : "empty";
+}
+
+/** 首启期间 App 跳过了更新检查；引导结束后补一次，避免新用户整场都不检查更新。 */
+function scheduleStartupUpdateCheck(): void {
+  if (!store.autoCheckUpdate) return;
+  window.setTimeout(() => {
+    if (!store.onboardingOpen && !store.checkingUpdate) void startupCheckUpdate();
+  }, 3000);
+}
+
+export function finishOnboarding(): void {
+  store.onboardingDone = true;
+  writeStoredBool(KEY_ONBOARDING_DONE, true);
+  store.onboardingOpen = false;
+  scheduleStartupUpdateCheck();
+}
+
+export function openOnboarding(): void {
+  store.onboardingOpen = true;
+}
+
+/** 首次启动且没看过引导时自动弹出（用户已导入过内容则不打扰）。 */
+export function maybeOpenOnboarding(): void {
+  if (!store.onboardingDone && !hasContent()) store.onboardingOpen = true;
+}
+
+/** 关闭引导（跳过 / 点了关闭都算已看过，不再自动弹出）。 */
+export function dismissOnboarding(): void {
+  store.onboardingOpen = false;
+  store.onboardingDone = true;
+  writeStoredBool(KEY_ONBOARDING_DONE, true);
+  scheduleStartupUpdateCheck();
+}
+
+export function dismissChecklist(): void {
+  store.checklistDismissed = true;
+  writeStoredBool(KEY_CHECKLIST_DISMISSED, true);
+}
+
+export function markExported(): void {
+  store.hasExported = true;
+  writeStoredBool(KEY_HAS_EXPORTED, true);
+}
+
+/**
+ * 字体兜底：用户没选字体时，自动挑一款系统字体（楷体优先）。
+ * 这样首次启动不会因为「未指定字体文件」直接失败。
+ */
+export async function ensureUsableFont(): Promise<string> {
+  const existing = store.fontPath.trim();
+  if (existing) {
+    // 路径可能来自旧预设 / 已被用户删除：失效时清掉再兜底
+    try {
+      if (await api.pathExists(existing)) return existing;
+    } catch {
+      // path_exists 不可用时按可用处理，交给渲染错误横幅兜底
+      return existing;
+    }
+    store.fontPath = "";
+    if (store.autoFontPath === existing) store.autoFontPath = "";
+  }
+  if (store.systemFonts.length === 0) await initSystemFonts();
+
+  const candidates = ["楷体", "华文楷体", "华文行楷", "楷体_GB2312", "仿宋", "苹方", "微软雅黑", "宋体"];
+  for (const name of candidates) {
+    const f = matchSystemFont(name);
+    if (f) {
+      store.fontPath = f.path;
+      store.autoFontPath = f.path;
+      return f.path;
+    }
+  }
+
+  const first =
+    store.systemFonts.find((f) =>
+      /kai|song|hei|yahei|noto.*cjk|sourcehan|cjk|pingfang|苹方|hiragino|stheiti|songti/i.test(
+        `${f.name} ${f.family} ${f.path}`,
+      ),
+    ) ?? store.systemFonts[0];
+  if (first) {
+    store.fontPath = first.path;
+    store.autoFontPath = first.path;
+    return first.path;
+  }
+  return "";
+}
+
+/**
+ * 纸张兜底：没选背景时，从内置预设里借一张确实存在的纸张，
+ * 避免「字体好了、背景又是空」的二次失败。
+ */
+export async function ensureUsableBackground(ignoreCurrent = false): Promise<string> {
+  const existing = store.backgroundPath.trim();
+  if (!ignoreCurrent && existing) {
+    try {
+      if (await api.pathExists(existing)) return existing;
+    } catch {
+      return existing;
+    }
+    store.backgroundPath = "";
+  }
+  if (store.presets.length === 0) await refreshPresets();
+
+  // 首屏优先纯白 / A4 白纸：版式参数（140px/97 行距）按 A4 纸张给，白纸最稳。
+  // 其次才是任意 A4、任意白纸；都没有时退回任意内置纸张。
+  const score = (name: string) => {
+    const n = name.toLowerCase();
+    if (n.includes("a4") && n.includes("白纸")) return 3;
+    if (n.includes("白纸")) return 2;
+    if (n.includes("a4")) return 1;
+    return 0;
+  };
+  const ordered = [...store.presets].sort((a, b) => score(b.name) - score(a.name));
+  const preferred = ordered.filter((p) => score(p.name) > 0);
+  const candidates = preferred.length > 0 ? preferred : ordered;
+
+  for (const p of candidates) {
+    try {
+      const params = await api.loadPreset(p.path);
+      const bg = (params.backgroundPath || "").trim();
+      if (bg && (await api.pathExists(bg))) {
+        store.backgroundPath = bg;
+        return bg;
+      }
+    } catch {
+      // 单个预设损坏不影响兜底
+    }
+  }
+
+  // presets/ 缺失或全部不可读时，直接探测 exe 旁的 backgrounds/：
+  // 发布包/开发仓库都带有这张 A4 纯白，不能因为预设坏了就没有纸。
+  try {
+    const presetDir = await api.defaultPresetDir();
+    const root = presetDir.replace(/[\\/]presets[\\/]?$/i, "");
+    for (const name of ["A4纯白.webp", "实线信纸.webp"]) {
+      const candidate = joinFsPath(root, "backgrounds", name);
+      if (await api.pathExists(candidate)) {
+        store.backgroundPath = candidate;
+        return candidate;
+      }
+    }
+  } catch {
+    // 命令层不可用时保持原有兜底结果
+  }
+  return ignoreCurrent ? "" : store.backgroundPath;
+}
+
+/**
+ * 首屏默认版式：内置纸张是 4200×5930 级的 A4 图，
+ * 直接沿用 36px 字号会小到看不清。这里按 A4 纸张给一套和内置预设同量级的
+ * 起步参数（只在用户还没动过参数、也没载入预设时生效）。
+ */
+export async function ensureStarterLayout(): Promise<void> {
+  if (store.currentPresetPath) return;
+  if (hasContent()) return;
+  const atDefaults =
+    store.fontSize === 36 &&
+    store.wordSpacing === 5 &&
+    store.lineSpacing === 48 &&
+    store.marginTop === 30 &&
+    store.marginBottom === 30 &&
+    store.marginLeft === 30 &&
+    store.marginRight === 30;
+  if (!atDefaults) return;
+  if (!store.backgroundPath.trim()) await ensureUsableBackground();
+
+  store.fontSize = 140;
+  store.wordSpacing = 0;
+  store.lineSpacing = 97;
+  store.wordSpacingSigma = 2;
+  store.lineSpacingSigma = 4;
+  store.fontSizeSigma = 4;
+  store.perturbX = 5;
+  store.perturbY = 6;
+  store.perturbThetaText = "0.07";
+  store.marginTop = 300;
+  store.marginBottom = 600;
+  store.marginLeft = 350;
+  store.marginRight = 350;
+  store.fontColor = "#130e0b";
+}
+
+/** 打开正文编辑弹窗（先保证有可用字体，避免编辑完渲染失败）。 */
+export async function openTextEditor(): Promise<void> {
+  await ensureUsableFont();
+  store.textEditorOpen = true;
+}
+
+export function closeTextEditor(): void {
+  store.textEditorOpen = false;
+}
+
+export const SAMPLE_PARAGRAPHS = [
+  "见字如面。",
+  "最近天气转凉，夜里写作业时总觉得手有些僵。我把这段时间的笔记重新誊了一遍，字还是有点潦草，你别见笑。",
+  "等忙完这一阵，找个周末回去看看。到时候一起去巷口那家小馆子，吃顿热乎的。",
+];
+
+/** 一键示例：铺好字体、纸张、版式和正文，直接出第一张成品。 */
+export async function loadSample(): Promise<void> {
+  await ensureUsableFont();
+  await ensureUsableBackground();
+
+  store.currentPresetPath = "";
+  store.currentPresetName = "";
+  store.presetDirty = false;
+  store.presetNotice = "";
+
+  store.fontSize = 140;
+  store.wordSpacing = 0;
+  store.lineSpacing = 97;
+  store.wordSpacingSigma = 2;
+  store.lineSpacingSigma = 4;
+  store.fontSizeSigma = 4;
+  store.perturbX = 5;
+  store.perturbY = 6;
+  store.perturbThetaText = "0.07";
+  store.marginTop = 300;
+  store.marginBottom = 600;
+  store.marginLeft = 350;
+  store.marginRight = 350;
+  store.fontColor = "#130e0b";
+  store.miswriteRate = 0;
+  store.boundsVisible = false;
+  store.roles = defaultRoles();
+  store.regions.splice(0);
+  store.regionMode = false;
+  store.editingIndex = -1;
+  store.highlightIndex = -1;
+  store.selectedRegionIndex = -1;
+  store.docPages = null;
+  store.docStatus = "";
+  setParagraphs(SAMPLE_PARAGRAPHS.map((text, i) => newPara(text, 0, i === 0 ? 0 : 2)));
+
+  store.currentPresetPath = "";
+  store.currentPresetName = "";
+  store.presetDirty = false;
+  store.status = "已载入示例，可直接导出，也可以换成你自己的文字";
+
+  finishOnboarding();
+  await doRender();
+  store.status = "已载入示例：可直接导出，或换成你自己的文字";
+}
+
+/** 首次引导的三个入口：写文字 / 填文档 / 看示例。 */
+export async function handleOnboardingTask(task: "text" | "document" | "sample"): Promise<void> {
+  // 只有「示例」需要在这里预确认；「填文档」由 importDocument 自己确认一次，避免连弹两次
+  if (task === "sample" && hasContent()) {
+    const ok = await confirmReplaceContent();
+    if (!ok) return;
+  }
+
+  if (task === "text") {
+    // 文档模式不显示主文字：先退出文档/区域模式，再打开正文编辑器
+    if (!(await confirmDiscardDocPages("text"))) return;
+    if ((store.docPages?.length ?? 0) > 0 || store.regions.length > 0) {
+      store.docPages = null;
+      store.docStatus = "";
+      store.regions.splice(0);
+      store.regionMode = false;
+      store.editingIndex = -1;
+      store.highlightIndex = -1;
+      store.selectedRegionIndex = -1;
+      store.backgroundPath = "";
+      await ensureUsableBackground();
+    }
+    await ensureUsableFont();
+    await ensureUsableBackground();
+    await ensureStarterLayout();
+    finishOnboarding();
+    await openTextEditor();
+    scheduleRender();
+    return;
+  }
+
+  await ensureUsableFont();
+  await ensureUsableBackground();
+  await ensureStarterLayout();
+  finishOnboarding();
+
+  if (task === "document") {
+    await importDocument();
+    return;
+  }
+  await loadSample();
+}
+
+
+
 
 // ---------------------------------------------------------------- 参数构建
 
@@ -112,9 +941,19 @@ const num = (v: number | null | undefined, fallback: number) =>
 /** 收集表单为引擎参数（对齐原 collect_params 的段落/纯文本分支语义）。 */
 export function buildParams(): UiParams {
   const paras = store.paragraphs
-    .filter((r) => cleanText(r.text).trim() !== "")
-    .map((r) => ({ text: cleanText(r.text), align: r.align, indentEm: r.indentEm }));
-  const hasFormat = store.paragraphs.some((r) => r.align !== 0 || r.indentEm !== 0);
+    .filter((r) => cleanText(r.text).trim() !== "" || (r.runs && r.runs.some((run) => cleanText(run.text).trim() !== "")))
+    .map((r) => ({
+      text: cleanText(r.text),
+      align: r.align,
+      indentEm: r.indentEm,
+      runs: r.runs?.map((run) => ({
+        text: cleanText(run.text),
+        style: run.style ? { ...run.style } : undefined,
+      })),
+    }));
+  const hasFormat = store.paragraphs.some(
+    (r) => r.align !== 0 || r.indentEm !== 0 || (r.runs && r.runs.length > 0),
+  );
 
   let text = "";
   let outParas = paras;
@@ -148,6 +987,7 @@ export function buildParams(): UiParams {
     text,
     paragraphs: outParas,
     regions: store.regions.map((r) => ({ ...r })),
+    roles: store.roles.map((r) => ({ ...r })),
     endChars: store.endChars,
     startChars: store.startChars,
     boundsVisible: store.boundsVisible,
@@ -158,6 +998,17 @@ export function buildParams(): UiParams {
 // ---------------------------------------------------------------- 预览渲染
 
 let renderSeq = 0;
+
+function classifyRenderError(message: string): "font" | "background" | "other" {
+  // 角色 / 文字区域的字体、文档后续页背景都不是「换主字体 / 换纸张」能修的
+  if ((message.includes("角色") || message.includes("文字区域")) && message.includes("字体")) {
+    return "other";
+  }
+  if (message.includes("页背景")) return "other";
+  if (message.includes("字体")) return "font";
+  if (message.includes("背景")) return "background";
+  return "other";
+}
 
 /** 立即重渲染（后台执行，UI 不阻塞；过期结果丢弃）。 */
 export async function doRender(): Promise<void> {
@@ -175,9 +1026,19 @@ export async function doRender(): Promise<void> {
     }));
     if (store.pageIndex >= pages.length) store.pageIndex = 0;
     store.status = `预览完成，共 ${pages.length} 页`;
+    // 只清理「渲染产生」的错误：导出/预设错误不应被一次成功渲染顺手擦掉
+    if (store.errorSource === "render") {
+      store.errorBanner = "";
+      store.errorKind = "";
+      store.errorSource = "";
+    }
   } catch (e) {
     if (seq !== renderSeq) return;
-    store.status = `渲染失败：${e}`;
+    const message = String(e);
+    store.status = `渲染失败：${message}`;
+    store.errorBanner = message;
+    store.errorKind = classifyRenderError(message);
+    store.errorSource = "render";
   } finally {
     if (seq === renderSeq) store.rendering = false;
   }
@@ -185,6 +1046,7 @@ export async function doRender(): Promise<void> {
 
 const debouncedRender = useDebounceFn(doRender, 300);
 export const scheduleRender = (): void => void debouncedRender();
+export const triggerPreview = scheduleRender;
 
 export function prevPage(): void {
   if (store.pageIndex > 0) store.pageIndex -= 1;
@@ -238,6 +1100,119 @@ watch(
   },
 );
 
+// ---------------------------------------------------------------- 系统字体管理与匹配
+
+let systemFontsPromise: Promise<void> | null = null;
+
+export async function initSystemFonts(): Promise<void> {
+  if (store.systemFonts.length > 0) return;
+  if (!systemFontsPromise) {
+    systemFontsPromise = (async () => {
+      try {
+        store.systemFonts = await api.listSystemFonts();
+      } catch (e) {
+        console.warn("获取系统字体列表失败:", e);
+        store.systemFonts = [];
+        // 允许下次重试（例如启动早期命令层尚未就绪）
+        systemFontsPromise = null;
+      }
+    })();
+  }
+  await systemFontsPromise;
+}
+
+const FONT_ALIAS_GROUPS: string[][] = [
+  ["仿宋", "fangsong", "仿宋_gb2312", "fangsong_gb2312", "simfang", "stfangsong", "华文仿宋"],
+  ["楷体", "kaiti", "楷体_gb2312", "kaiti_gb2312", "simkai", "stkaiti", "kaitisc", "华文楷体"],
+  ["微软雅黑", "microsoftyahei", "microsoftyaheiui", "yahei", "msyh"],
+  ["宋体", "simsun", "新宋体", "nsimsun", "songtisc", "songti", "stsong", "华文宋体"],
+  ["黑体", "simhei", "heitisc", "heiti", "stxihei", "stheitilight", "stheitimedium", "华文细黑", "华文黑体"],
+  ["等线", "dengxian", "deng"],
+  ["幼圆", "youyuan", "simyou"],
+  ["隶书", "lisu", "simli", "stliti", "华文隶书"],
+  ["华文行楷", "stxingkai", "xingkai"],
+  ["华文中宋", "stzhongsong"],
+  ["华文琥珀", "sthupo"],
+  ["华文彩云", "stcaiyun"],
+  ["华文新魏", "stxinwei"],
+  ["方正舒体", "fzshuti", "fzstk"],
+  ["方正姚体", "fzyaoti", "fzytk"],
+  ["苹方", "pingfang", "pingfangsc"],
+  ["思源黑体", "notosanssc", "notosanscjk", "notosans", "sourcehansanscn", "sourcehansans"],
+  ["思源宋体", "notoserifsc", "notoserifcjk", "notoserif", "sourcehanserifcn", "sourcehanserif"],
+  ["文泉驿微米黑", "wenquanyimicrohei", "wqymicrohei"],
+  ["文泉驿正黑", "wenquanyizenhei", "wqyzenhei"],
+  ["arial", "arialmt"],
+  ["timesnewroman", "times", "timeroman"],
+  ["calibri"],
+  ["couriernew", "courier"],
+  ["tahoma"],
+  ["verdana"],
+  ["segoeui", "segoe"],
+];
+
+function normalizeFontStr(s: string): string {
+  return s.toLowerCase().replace(/[\s\-_]/g, "").replace(/gb2312|regular|normal|bold|italic|ui|sc|light/g, "");
+}
+
+/** 智能模糊匹配系统字体（支持中英文别名、简写及规范化匹配） */
+export function matchSystemFont(fontName?: string | null): SystemFontItem | undefined {
+  if (!fontName || !fontName.trim() || store.systemFonts.length === 0) return undefined;
+  const raw = fontName.trim();
+  const rawLower = raw.toLowerCase();
+  const rawNorm = rawLower.replace(/[\s\-_]/g, "");
+
+  // 1. 尝试完全/规范化精确匹配（name, family, 或 path 中文件名）
+  let found = store.systemFonts.find(
+    (f) =>
+      f.name.toLowerCase() === rawLower ||
+      f.family.toLowerCase() === rawLower ||
+      f.name.toLowerCase().replace(/[\s\-_]/g, "") === rawNorm ||
+      f.family.toLowerCase().replace(/[\s\-_]/g, "") === rawNorm,
+  );
+  if (found) return found;
+
+  // 2. 尝试别名组匹配
+  for (const group of FONT_ALIAS_GROUPS) {
+    const matchesInput = group.some(
+      (alias) =>
+        rawNorm === alias ||
+        rawNorm.includes(alias) ||
+        alias.includes(rawNorm) ||
+        normalizeFontStr(raw) === normalizeFontStr(alias),
+    );
+    if (matchesInput) {
+      for (const alias of group) {
+        found = store.systemFonts.find((f) => {
+          const fn = f.name.toLowerCase().replace(/[\s\-_]/g, "");
+          const ff = f.family.toLowerCase().replace(/[\s\-_]/g, "");
+          const fp = f.path.toLowerCase().replace(/[\s\-_]/g, "");
+          return fn.includes(alias) || ff.includes(alias) || fp.includes(alias);
+        });
+        if (found) return found;
+      }
+    }
+  }
+
+  // 3. 包含关系模糊匹配
+  const stripped = normalizeFontStr(raw);
+  if (stripped.length >= 2) {
+    found = store.systemFonts.find((f) => {
+      const fn = normalizeFontStr(f.name);
+      const ff = normalizeFontStr(f.family);
+      return (
+        fn.includes(stripped) ||
+        ff.includes(stripped) ||
+        stripped.includes(fn) ||
+        stripped.includes(ff)
+      );
+    });
+    if (found) return found;
+  }
+
+  return undefined;
+}
+
 // ---------------------------------------------------------------- 文件选择类动作
 
 export async function chooseFont(): Promise<void> {
@@ -250,17 +1225,265 @@ export async function chooseBackground(): Promise<void> {
   if (typeof p === "string") store.backgroundPath = p;
 }
 
+/**
+ * 当导入的 Word 文档包含高亮或背景色标记时，询问用户想要的效果：
+ * - 'mixed': 混合填空模式（高亮文字设为手写体，未标记文字转为打印体模板）
+ * - 'all_handwriting': 全文手写模式（忽略高亮标记，所有文字统一作为手写体排版）
+ * - 'cancel': 取消导入
+ */
+export function askDocxHighlightMode(): Promise<"mixed" | "all_handwriting" | "cancel"> {
+  return new Promise((resolve) => {
+    let resolved = false;
+    appDialog.create({
+      title: "Word 文档高亮排版模式",
+      content:
+        "检测到该 Word 文档中包含背景高亮或颜色标记，请选择排版方式：\n\n" +
+        "• 混合填空模式：高亮文字识别为手写体，未标记文字保留为打印体（适合试卷/表格填空）。\n\n" +
+        "• 全文手写模式：忽略所有高亮背景标记，文档全部内容统一作为手写体排版（适合保留原模板、全篇手写）。",
+      positiveText: "混合填空模式",
+      negativeText: "全文手写模式",
+      closable: true,
+      maskClosable: true,
+      onPositiveClick: () => {
+        resolved = true;
+        resolve("mixed");
+      },
+      onNegativeClick: () => {
+        resolved = true;
+        resolve("all_handwriting");
+      },
+      onClose: () => {
+        if (!resolved) {
+          resolved = true;
+          resolve("cancel");
+        }
+      },
+      onMaskClick: () => {
+        if (!resolved) {
+          resolved = true;
+          resolve("cancel");
+        }
+      },
+    });
+  });
+}
+
+/**
+ * 询问用户导入文档底图的处理方式：
+ * - 'detect': 识别高亮填空（自动检测背景高亮色块并无痕擦除，提取标记文字为手写填空区域）
+ * - 'pure': 仅作为纯底图（保留原始所有背景颜色与文字，不擦除底色、不自动生成选框）
+ * - 'cancel': 取消导入
+ */
+export function askDocumentImportMode(): Promise<"detect" | "pure" | "cancel"> {
+  return new Promise((resolve) => {
+    let resolved = false;
+    appDialog.create({
+      title: "文档底图导入模式",
+      content:
+        "检测到您正在导入文档底图（PDF / Word），请选择导入效果：\n\n" +
+        "• 识别高亮填空：自动检测并擦除背景高亮色块，将标记文字提取为手写填空区域（未标记文字保留为打印底图）。\n\n" +
+        "• 仅作为纯底图：完整保留原文档所有背景色彩与版式，不擦除任何高亮，不自动生成选框（原样作为背景信纸）。",
+      positiveText: "识别高亮填空",
+      negativeText: "仅作为纯底图",
+      closable: true,
+      maskClosable: true,
+      onPositiveClick: () => {
+        resolved = true;
+        resolve("detect");
+      },
+      onNegativeClick: () => {
+        resolved = true;
+        resolve("pure");
+      },
+      onClose: () => {
+        if (!resolved) {
+          resolved = true;
+          resolve("cancel");
+        }
+      },
+      onMaskClick: () => {
+        if (!resolved) {
+          resolved = true;
+          resolve("cancel");
+        }
+      },
+    });
+  });
+}
+
 export async function importDocx(): Promise<void> {
   const p = await dialogs.pickDocx();
   if (!p) return;
+  await ensureUsableFont();
+
+  // Word 正文会覆盖当前内容：文档/区域/已输入文字任一存在时都先确认
+  const hadDoc = (store.docPages?.length ?? 0) > 0;
+  const hadRegions = store.regions.length > 0;
+  const hadText = hasTextContent();
+  if (hadDoc || hadRegions || hadText) {
+    const ok = await confirmReplaceContent();
+    if (!ok) return;
+  }
+
   try {
-    const rows = await api.importDocx(p, num(store.fontSize, 36));
-    const fs = num(store.fontSize, 36);
-    setParagraphs(
-      rows.map(([t, align, indentPx]) => newPara(cleanText(t), align as 0 | 1 | 2, fs > 0 ? indentPx / fs : 0)),
+    if (store.systemFonts.length === 0) {
+      await initSystemFonts();
+    }
+    const res = await api.importDocx(p, num(store.fontSize, 36));
+    const rows = res.paragraphs;
+
+    // 检查文档是否包含高亮或独立角色标记（混合模式 vs 纯手写模式）
+    const hasHighlightsInDoc = rows.some((row) =>
+      row.runs?.some(
+        (r) =>
+          r.style?.highlight != null ||
+          ((r.style?.roleId ?? 0) >= 2 && !r.style?.printed),
+      ),
     );
+
+    let useHighlights = false;
+    if (hasHighlightsInDoc) {
+      const mode = await askDocxHighlightMode();
+      if (mode === "cancel") return;
+      useHighlights = mode === "mixed";
+    }
+
+    setParagraphs(
+      rows.map((row) =>
+        newPara(
+          cleanText(row.text),
+          (row.align ?? 0) as 0 | 1 | 2,
+          row.indentEm ?? 0,
+          row.runs?.map((r) => {
+            const runStyle = r.style ? { ...r.style } : undefined;
+            if (useHighlights) {
+              // 混合模式：未高亮片段 (role_id == 1 或 printed == true)
+              if (runStyle && (runStyle.roleId === 1 || runStyle.printed)) {
+                if (runStyle.fontFamily) {
+                  const matched = matchSystemFont(runStyle.fontFamily);
+                  if (matched) {
+                    runStyle.fontPath = matched.path;
+                  }
+                }
+              }
+            } else {
+              // 纯手写模式：所有 run 清理为 role_id = 0, printed = false, fontPath = undefined, highlight = undefined
+              if (runStyle) {
+                runStyle.roleId = 0;
+                runStyle.printed = false;
+                runStyle.fontPath = undefined;
+                runStyle.highlight = undefined;
+              }
+            }
+            return {
+              text: cleanText(r.text),
+              style: runStyle,
+            };
+          }),
+        ),
+      ),
+    );
+
+    // 基础角色：Role 0 (主字体) 与 Role 1 (打印体)
+    const role0: UiHandwritingRole = store.roles.find((r) => r.id === 0) || {
+      id: 0,
+      name: "默认手写 (主字体)",
+      fontPath: "",
+      printed: false,
+      fill: null,
+    };
+    const role1: UiHandwritingRole = store.roles.find((r) => r.id === 1) || {
+      id: 1,
+      name: "打印体 (无扰动)",
+      fontPath: "",
+      printed: true,
+      fill: null,
+    };
+
+    if (useHighlights) {
+      // 自动匹配文档主字体 -> Role 1 (打印体)
+      if (res.docFontFamily) {
+        const matched = matchSystemFont(res.docFontFamily);
+        if (matched) {
+          role1.fontPath = matched.path;
+        }
+      }
+    }
+
+    const nextRoles: UiHandwritingRole[] = [role0, role1];
+
+    if (useHighlights) {
+      // 动态提取并自适应角色（收集 roleId >= 2 及对应的 highlight/fill）
+      const detectedRoles = new Map<number, { highlight?: string | null; fill?: string | null }>();
+      for (const row of rows) {
+        if (row.runs) {
+          for (const run of row.runs) {
+            const rId = run.style?.roleId;
+            if (rId && rId >= 2) {
+              if (!detectedRoles.has(rId)) {
+                detectedRoles.set(rId, {
+                  highlight: run.style?.highlight ?? null,
+                  fill: run.style?.fill ?? null,
+                });
+              } else {
+                const cur = detectedRoles.get(rId)!;
+                if (!cur.highlight && run.style?.highlight) cur.highlight = run.style.highlight;
+                if (!cur.fill && run.style?.fill) cur.fill = run.style.fill;
+              }
+            }
+          }
+        }
+      }
+
+      if (detectedRoles.size > 0) {
+        for (const [rId, info] of detectedRoles.entries()) {
+          const hlInfo = getHighlightInfo(info.highlight);
+          const highlightLabel = hlInfo?.name;
+          const colorLabel = info.fill ? `颜色 ${info.fill}` : null;
+          const subLabel = highlightLabel || colorLabel || "自定颜色";
+          const roleName = `手写角色 ${rId - 1} (${subLabel})`;
+
+          const prevRole = store.roles.find((r) => r.id === rId);
+
+          nextRoles.push({
+            id: rId,
+            name: roleName,
+            fontPath: prevRole?.fontPath || "",
+            printed: false,
+            highlight: info.highlight ?? null,
+            fill: info.fill ?? null,
+          });
+        }
+        nextRoles.sort((a, b) => a.id - b.id);
+      }
+    }
+
+    // 保留未被本次导入覆盖的自定义角色：段落 runs 与既有 regions 仍可能引用它们，
+    // 整表替换会让这些引用静默失效（对齐 importDocument 的合并行为）
+    for (const existing of store.roles) {
+      if (existing.id >= 2 && !nextRoles.some((r) => r.id === existing.id)) {
+        nextRoles.push({ ...existing });
+      }
+    }
+    nextRoles.sort((a, b) => a.id - b.id);
+    store.roles = nextRoles;
+
+    // 导入成功后再退出文档模式，失败时原文档底图/区域仍保留
+    if (hadDoc) {
+      store.docPages = null;
+      store.docStatus = "";
+      store.backgroundPath = "";
+      await ensureUsableBackground();
+    }
+    if (hadRegions) {
+      store.regions.splice(0);
+      store.editingIndex = -1;
+      store.highlightIndex = -1;
+      store.selectedRegionIndex = -1;
+    }
+
     focusPara(store.paragraphs[0].id, 0);
-    store.status = `已导入 ${rows.length} 个段落，回车分段、按钮设格式`;
+    store.status = `已导入 ${rows.length} 个段落${useHighlights ? "（混合填空模式）" : "（全文手写模式）"}`;
     scheduleRender();
   } catch (e) {
     store.status = `导入 docx 失败：${e}`;
@@ -270,16 +1493,77 @@ export async function importDocx(): Promise<void> {
 export async function importDocument(): Promise<void> {
   const p = await dialogs.pickDocument();
   if (!p) return;
-  store.status = "正在渲染文档底图…";
+  await ensureUsableFont();
+
+  // 文档模式不显示主文字：已有正文/底图/区域时先确认，导入成功后收起旧内容
+  const hadText = hasTextContent();
+  const hadDocState = (store.docPages?.length ?? 0) > 0 || store.regions.length > 0;
+  if (hadText || hadDocState) {
+    const ok = await confirmReplaceContent();
+    if (!ok) return;
+  }
+
+  const mode = await askDocumentImportMode();
+  if (mode === "cancel") return;
+
+  const extractRegions = mode === "detect";
+  store.status = extractRegions ? "正在智能识别文档高亮并渲染底图…" : "正在渲染原版文档底图…";
   try {
-    const pages = await api.importDocument(p);
-    if (!pages.length) throw new Error("未得到任何页面");
-    store.docPages = pages; // 先写 docPages 再切背景，避免 syncDocState 误清
-    store.docStatus = `已导入 ${pages.length} 页，可逐页框选`;
-    store.backgroundPath = pages[0];
-    loadBgDimensions(pages[0]);
-    store.status = `已导入文档底图（${pages.length} 页）；在目标页开启「框选」即可填写`;
-    scheduleRender();
+    const res = await api.importDocument(p, extractRegions);
+    if (!res.pages.length) throw new Error("未得到任何页面");
+    // 新文档底图会替换旧底图：旧区域坐标全部失效，先清空再写入本次识别结果
+    store.regions.splice(0);
+    store.editingIndex = -1;
+    store.highlightIndex = -1;
+    store.selectedRegionIndex = -1;
+    store.docPages = res.pages; // 先写 docPages 再切背景，避免 syncDocState 误清
+    store.backgroundPath = res.pages[0];
+    loadBgDimensions(res.pages[0]);
+    if (extractRegions && res.regions.length > 0) {
+      const detectedRoleIds = Array.from(
+        new Set(
+          res.regions
+            .map((r) => r.roleId)
+            .filter((id): id is number => typeof id === "number" && id >= 2),
+        ),
+      ).sort((a, b) => a - b);
+
+      for (const roleId of detectedRoleIds) {
+        const matchingRegion =
+          res.regions.find((r) => r.roleId === roleId && r.highlight) ||
+          res.regions.find((r) => r.roleId === roleId);
+        const highlight = matchingRegion?.highlight ?? null;
+        const hlInfo = getHighlightInfo(highlight);
+        const name = `手写角色 ${roleId - 1}${hlInfo ? ` (${hlInfo.name})` : ""}`;
+        const existingRole = store.roles.find((r) => r.id === roleId);
+        if (existingRole) {
+          if (!existingRole.highlight && highlight) existingRole.highlight = highlight;
+        } else {
+          store.roles.push({
+            id: roleId,
+            name,
+            fontPath: "",
+            printed: false,
+            highlight: highlight ?? null,
+            fill: null,
+          });
+        }
+      }
+      store.roles.sort((a, b) => a.id - b.id);
+
+      store.regions = res.regions;
+      store.selectedRegionIndex = 0;
+      store.docStatus = `已导入 ${res.pages.length} 页，识别 ${res.regions.length} 处手写填空`;
+      store.status = `已导入文档底图（共 ${res.pages.length} 页），并自动识别提取了 ${res.regions.length} 处手写填空区域！`;
+    } else {
+      store.docStatus = `已导入 ${res.pages.length} 页${extractRegions ? "" : "（纯底图模式）"}`;
+      store.status = extractRegions
+        ? `已导入文档底图（共 ${res.pages.length} 页，未检测到高亮填空标记）`
+        : `已导入文档底图（共 ${res.pages.length} 页，已保留原文档全部背景与色彩）`;
+    }
+    // 成功切换后再收起正文：失败时用户的原文字还在
+    if (hadText) setParagraphs([newPara()]);
+    triggerPreview();
   } catch (e) {
     store.docStatus = "";
     store.status = `导入文档失败：${e}`;
@@ -294,7 +1578,13 @@ export async function importDocument(): Promise<void> {
 
 // ---------------------------------------------------------------- 预设
 
-export function applyPreset(p: UiParams, msg?: string): void {
+export function applyPreset(
+  p: UiParams,
+  msg?: string,
+  meta?: { path?: string; name?: string },
+): void {
+  suppressPresetDirty = true;
+  store.presetNotice = "";
   store.fontPath = p.fontPath;
   store.backgroundPath = p.backgroundPath;
   loadBgDimensions(p.backgroundPath);
@@ -319,9 +1609,169 @@ export function applyPreset(p: UiParams, msg?: string): void {
   store.boundsColor = normalizeHex(p.boundsColor || "#4ca6a6");
   store.endChars = p.endChars ?? "，。";
   store.startChars = p.startChars ?? "";
+  if (p.roles && p.roles.length > 0) {
+    const nextRoles = p.roles.map((r) => ({ ...r }));
+    // 当前段落 runs / regions 引用、但预设里没有的角色需要保留，
+    // 否则这些引用会静默回退到默认角色
+    const referenced = new Set<number>();
+    for (const para of store.paragraphs) {
+      for (const run of para.runs ?? []) {
+        const rid = run.style?.roleId ?? 0;
+        if (rid >= 2) referenced.add(rid);
+      }
+    }
+    for (const region of store.regions) {
+      const rid = region.roleId ?? 0;
+      if (rid >= 2) referenced.add(rid);
+    }
+    for (const rid of referenced) {
+      if (!nextRoles.some((r) => r.id === rid)) {
+        const existing = store.roles.find((r) => r.id === rid);
+        if (existing) nextRoles.push({ ...existing });
+      }
+    }
+    nextRoles.sort((a, b) => a.id - b.id);
+    store.roles = nextRoles;
+  }
   store.docPages = null;
   store.docStatus = "";
+  // 预设会同时换纸张：旧底图上的区域坐标随之失效，一并清掉（载入前已确认）
+  store.regions.splice(0);
+  store.regionMode = false;
+  store.editingIndex = -1;
+  store.highlightIndex = -1;
+  store.selectedRegionIndex = -1;
+  store.currentPresetPath = meta?.path ?? "";
+  store.currentPresetName = meta?.name ?? "";
+  store.presetDirty = false;
   if (msg) store.status = msg;
+  // applyPreset 自身会触发参数快照 watch；在 nextTick 里复位，避免刚载入就显示「已修改」
+  void nextTick(() => {
+    suppressPresetDirty = false;
+    store.presetDirty = false;
+  });
+}
+
+let suppressPresetDirty = false;
+
+/** 预设只关心这些字段；用户改任意一项就标记「已修改」。 */
+const presetParamSnapshot = (): string =>
+  JSON.stringify({
+    fontPath: store.fontPath,
+    backgroundPath: store.backgroundPath,
+    fontSize: store.fontSize,
+    wordSpacing: store.wordSpacing,
+    lineSpacing: store.lineSpacing,
+    wordSpacingSigma: store.wordSpacingSigma,
+    lineSpacingSigma: store.lineSpacingSigma,
+    fontSizeSigma: store.fontSizeSigma,
+    perturbX: store.perturbX,
+    perturbY: store.perturbY,
+    perturbThetaText: store.perturbThetaText,
+    miswriteRate: store.miswriteRate,
+    miswriteModeIndex: store.miswriteModeIndex,
+    strikeoutStyleIndex: store.strikeoutStyleIndex,
+    fontColor: store.fontColor,
+    marginTop: store.marginTop,
+    marginBottom: store.marginBottom,
+    marginLeft: store.marginLeft,
+    marginRight: store.marginRight,
+    boundsVisible: store.boundsVisible,
+    boundsColor: store.boundsColor,
+    endChars: store.endChars,
+    startChars: store.startChars,
+    roles: store.roles,
+  });
+
+watch(presetParamSnapshot, () => {
+  if (suppressPresetDirty) return;
+  if (store.currentPresetPath || store.currentPresetName) store.presetDirty = true;
+});
+
+// 用户手动换字体 / 纸张后，上一条「预设资产缺失」提示就过期了
+watch(
+  () => `${store.fontPath}\u0000${store.backgroundPath}`,
+  () => {
+    if (!suppressPresetDirty) store.presetNotice = "";
+  },
+);
+
+/** 已有内容时，从引导里重选「示例 / 填文档」需要确认，避免覆盖当前工作。 */
+function confirmReplaceContent(): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    appDialog.warning({
+      title: "当前已有内容",
+      content: "继续会替换或叠加当前内容。建议先导出，或先保存成预设。",
+      positiveText: "继续",
+      negativeText: "取消",
+      onPositiveClick: () => finish(true),
+      onNegativeClick: () => finish(false),
+      onClose: () => finish(false),
+      onMaskClick: () => finish(false),
+    });
+  });
+}
+
+function confirmDiscardDocPages(reason: "preset" | "text" = "preset"): Promise<boolean> {
+  if (!store.docPages?.length && store.regions.length === 0) return Promise.resolve(true);
+  const toText = reason === "text";
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    appDialog.warning({
+      title: toText ? "切换到文字模式？" : "切换预设会重置文档底图与文字区域",
+      content: toText
+        ? "当前已导入文档底图或创建了文字区域。继续会清空这些内容，回到纯文字排版；建议先导出。"
+        : "当前已导入文档底图或手动创建了文字区域。切换预设会清空这些内容，建议先导出或保存当前设置。",
+      positiveText: toText ? "切换并编辑" : "继续切换",
+      negativeText: "取消",
+      onPositiveClick: () => finish(true),
+      onNegativeClick: () => finish(false),
+      onClose: () => finish(false),
+      onMaskClick: () => finish(false),
+    });
+  });
+}
+
+/** 预设里的字体 / 纸张可能在本机不存在：能兜底就兜底，并给出可读提示。 */
+async function sanitizePresetAssets(p: UiParams): Promise<{ params: UiParams; warning: string }> {
+  const warnings: string[] = [];
+
+  let fontPath = (p.fontPath || "").trim();
+  if (!fontPath) {
+    fontPath = await ensureUsableFont();
+  } else if (!(await api.pathExists(fontPath))) {
+    const missing = fileName(fontPath);
+    await ensureUsableFont();
+    if (store.fontPath.trim()) {
+      warnings.push(`字体「${missing}」本机未安装，已沿用当前字体`);
+      fontPath = store.fontPath;
+    } else {
+      warnings.push(`字体「${missing}」本机未安装，请先选择一款字体`);
+      fontPath = "";
+    }
+  }
+
+  let backgroundPath = (p.backgroundPath || "").trim();
+  const inDocumentMode = (store.docPages?.length ?? 0) > 0;
+  if (backgroundPath && !(await api.pathExists(backgroundPath))) {
+    warnings.push("纸张图片缺失，已回退到可用纸张");
+    // 文档模式下 store.backgroundPath 是底图 PNG，不能拿它当新预设的纸张
+    backgroundPath = inDocumentMode ? "" : store.backgroundPath;
+  }
+  if (!backgroundPath) backgroundPath = await ensureUsableBackground(inDocumentMode);
+
+  return { params: { ...p, fontPath, backgroundPath }, warning: warnings.join("；") };
 }
 
 function normalizeHex(s: string): string {
@@ -339,11 +1789,29 @@ export async function refreshPresets(): Promise<void> {
 
 export async function selectPreset(path: string): Promise<void> {
   try {
+    if (!(await confirmDiscardDocPages())) return;
     const p = await api.loadPreset(path);
-    applyPreset(p, `已载入预设：${path}`);
+    const safe = await sanitizePresetAssets(p);
+    const name =
+      store.presets.find((x) => x.path === path)?.name ||
+      fileName(path).replace(/\.json$/i, "");
+    applyPreset(
+      safe.params,
+      safe.warning ? `已载入预设：${name}（${safe.warning}）` : `已载入预设：${name}`,
+      { path, name },
+    );
+    store.presetNotice = safe.warning;
+    if (store.errorSource === "preset") {
+      store.errorBanner = "";
+      store.errorKind = "";
+      store.errorSource = "";
+    }
     scheduleRender();
   } catch (e) {
     store.status = `载入失败：${e}`;
+    store.errorBanner = `预设载入失败：${e}`;
+    store.errorKind = "other";
+    store.errorSource = "preset";
   }
 }
 
@@ -351,7 +1819,6 @@ export async function loadPresetFromDialog(): Promise<void> {
   const p = await dialogs.pickPreset();
   if (!p) return;
   await selectPreset(p);
-  store.status = "预设已载入（含边距/扰动参数）";
 }
 
 export async function savePresetToDialog(): Promise<void> {
@@ -364,6 +1831,10 @@ export async function savePresetToDialog(): Promise<void> {
     if (target.replace(/\\/g, "/").startsWith(defaultDir.replace(/\\/g, "/"))) {
       await refreshPresets();
     }
+    store.currentPresetPath = target;
+    store.currentPresetName = fileName(target).replace(/\.json$/i, "");
+    store.presetDirty = false;
+    store.presetNotice = "";
   } catch (e) {
     store.status = `保存失败：${e}`;
   }
@@ -378,8 +1849,17 @@ export async function exportFiles(): Promise<void> {
   try {
     const files = await api.exportFiles(buildParams(), dir);
     store.status = `已导出 ${files.length} 个文件到 ${dir}`;
+    markExported();
+    if (store.errorSource === "export") {
+      store.errorBanner = "";
+      store.errorKind = "";
+      store.errorSource = "";
+    }
   } catch (e) {
     store.status = `导出失败：${e}`;
+    store.errorBanner = `导出失败：${e}`;
+    store.errorKind = "other";
+    store.errorSource = "export";
   }
 }
 
@@ -390,8 +1870,17 @@ export async function exportPdf(): Promise<void> {
   try {
     await api.exportPdf(buildParams(), path);
     store.status = `PDF 已导出：${path}`;
+    markExported();
+    if (store.errorSource === "export") {
+      store.errorBanner = "";
+      store.errorKind = "";
+      store.errorSource = "";
+    }
   } catch (e) {
     store.status = `导出 PDF 失败：${e}`;
+    store.errorBanner = `导出 PDF 失败：${e}`;
+    store.errorKind = "other";
+    store.errorSource = "export";
   }
 }
 
@@ -429,21 +1918,83 @@ export function setParagraphs(list: Para[]): void {
   updateParaStatus();
 }
 
+/** 获取当前选区覆盖的段落 ID 列表（若未多选则返回当前聚焦段 ID） */
+export function getSelectedParaIds(): number[] {
+  if (typeof window === "undefined") return [];
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) {
+    const cur = store.paragraphs[curParaIndex()];
+    return cur ? [cur.id] : [];
+  }
+  const range = sel.getRangeAt(0);
+  const editor = document.querySelector(".para-editor");
+  if (!editor || !editor.contains(range.commonAncestorContainer)) {
+    const cur = store.paragraphs[curParaIndex()];
+    return cur ? [cur.id] : [];
+  }
+  const rows = Array.from(editor.querySelectorAll<HTMLElement>(".para-row"));
+  const selected: number[] = [];
+  for (const row of rows) {
+    if (sel.containsNode(row, true) || range.intersectsNode(row)) {
+      const id = Number(row.dataset.id);
+      if (id) selected.push(id);
+    }
+  }
+  if (selected.length > 0) return selected;
+  const cur = store.paragraphs[curParaIndex()];
+  return cur ? [cur.id] : [];
+}
+
 export function setAlign(align: number): void {
-  const row = store.paragraphs[curParaIndex()];
-  if (!row) return;
-  row.align = (Math.max(0, Math.min(2, align)) as 0 | 1 | 2);
+  const ids = getSelectedParaIds();
+  if (ids.length > 0) {
+    for (const id of ids) {
+      const row = store.paragraphs.find((p) => p.id === id);
+      if (row) {
+        row.align = (Math.max(0, Math.min(2, align)) as 0 | 1 | 2);
+      }
+    }
+  } else {
+    const row = store.paragraphs[curParaIndex()];
+    if (row) row.align = (Math.max(0, Math.min(2, align)) as 0 | 1 | 2);
+  }
   updateParaStatus();
   scheduleRender();
 }
 
 export function toggleIndent(on: boolean): void {
-  const row = store.paragraphs[curParaIndex()];
-  if (!row) return;
-  row.indentEm = on ? 2.0 : 0.0;
+  const ids = getSelectedParaIds();
+  if (ids.length > 0) {
+    for (const id of ids) {
+      const row = store.paragraphs.find((p) => p.id === id);
+      if (row) {
+        row.indentEm = on ? 2.0 : 0.0;
+      }
+    }
+  } else {
+    const row = store.paragraphs[curParaIndex()];
+    if (row) row.indentEm = on ? 2.0 : 0.0;
+  }
   updateParaStatus();
   scheduleRender();
 }
+
+let activeRoleApplier: ((roleId: number) => void) | null = null;
+
+export function registerRoleApplier(fn: (roleId: number) => void): () => void {
+  activeRoleApplier = fn;
+  return () => {
+    if (activeRoleApplier === fn) activeRoleApplier = null;
+  };
+}
+
+export function applyRoleToSelection(roleId: number): void {
+  if (activeRoleApplier) {
+    activeRoleApplier(roleId);
+  }
+}
+
+
 
 export function splitPara(id: number, caretOffset: number): void {
   const idx = store.paragraphs.findIndex((p) => p.id === id);
@@ -539,12 +2090,25 @@ export function regionHasOverrides(r: Region): boolean {
   );
 }
 
-/** 区域列表摘要（对齐 models.rs TextRegion::label；自定义过追加 ⚙ 标记）。 */
+/** 区域列表摘要（对齐 models.rs TextRegion::label；自定义过追加 ⚙ 标记，
+ *  表格单元格区域前缀 表N· 标注归属）。 */
 export function regionLabel(r: Region, index: number): string {
-  const style = r.printed ? "打印" : "手写";
+  let style = r.printed ? "🖨️ 打印" : "✍️ 手写";
+  if (r.roleId && r.roleId >= 2) {
+    const role = store.roles.find((role) => role.id === r.roleId);
+    if (role) {
+      const badge = getRoleBadgeInfo(role);
+      style = `${badge.icon} ${role.name}`;
+    } else {
+      const hlInfo = getHighlightInfo(r.highlight);
+      const icon = hlInfo?.icon || "✍️";
+      style = `${icon} 手写角色 ${r.roleId - 1}${hlInfo ? ` (${hlInfo.name})` : ""}`;
+    }
+  }
   const page = r.page > 1 ? ` 第${r.page}页` : "";
   const custom = regionHasOverrides(r) ? " ⚙" : "";
-  return `${index}. ${style}${page} ${[...r.text].length}字 (${r.x},${r.y} ${r.w}×${r.h})${custom}`;
+  const tablePrefix = r.tableIndex ? `表${r.tableIndex}·` : "";
+  return `${tablePrefix}${index}. ${style}${page} ${[...r.text].length}字 (${r.x},${r.y} ${r.w}×${r.h})${custom}`;
 }
 
 /** 把矩形钳制到背景范围并保证最小尺寸（对齐原 clamp_rect）。
@@ -583,6 +2147,8 @@ const defaultRegionDraft = (page: number): Region => ({
   w: 0,
   h: 0,
   text: "",
+  roleId: 0,
+  highlight: null,
   fontPath: "",
   printed: false,
   fontSize: 0,
@@ -615,6 +2181,9 @@ export function openEditRegionDialog(index: number): void {
   if (!r) return;
   store.dialogTargetIndex = index;
   const draft: Region = { ...r };
+  if (draft.roleId === undefined) {
+    draft.roleId = draft.printed ? 1 : 0;
+  }
   if (!draft.paragraphs || draft.paragraphs.length === 0) {
     if (draft.text) {
       draft.paragraphs = draft.text.split("\n").map((line) => ({
@@ -679,6 +2248,20 @@ export async function chooseRegionFont(): Promise<void> {
   if (typeof p === "string") d.fontPath = p;
 }
 
+/** 将字体与字号批量应用到某张表格的全部单元格区域。 */
+export function applyFontToTable(tableIndex: number, fontPath: string, fontSize: number): void {
+  let n = 0;
+  for (const r of store.regions) {
+    if (r.tableIndex === tableIndex) {
+      r.fontPath = fontPath;
+      r.fontSize = fontSize;
+      n++;
+    }
+  }
+  store.status = `已将字体应用到表格 ${tableIndex} 的 ${n} 个单元格`;
+  scheduleRender();
+}
+
 /** 导入 docx 到对话框草稿：保留各段独立对齐与缩进。 */
 export async function importDocxToDraft(): Promise<void> {
   const d = store.dialogDraft;
@@ -686,13 +2269,56 @@ export async function importDocxToDraft(): Promise<void> {
   const p = await dialogs.pickDocx();
   if (!p) return;
   try {
-    const rows = await api.importDocx(p, draftFontSize(d));
+    if (store.systemFonts.length === 0) {
+      await initSystemFonts();
+    }
+    const res = await api.importDocx(p, draftFontSize(d));
+    const rows = res.paragraphs;
     if (!rows.length) throw new Error("文档为空");
-    const fs = draftFontSize(d);
-    d.paragraphs = rows.map(([t, align, indentPx]) => ({
-      text: cleanText(t),
-      align: align as 0 | 1 | 2,
-      indentEm: fs > 0 ? indentPx / fs : 0,
+
+    const hasHighlightsInDoc = rows.some((row) =>
+      row.runs?.some(
+        (r) =>
+          r.style?.highlight != null ||
+          ((r.style?.roleId ?? 0) >= 2 && !r.style?.printed),
+      ),
+    );
+
+    let useHighlights = false;
+    if (hasHighlightsInDoc) {
+      const mode = await askDocxHighlightMode();
+      if (mode === "cancel") return;
+      useHighlights = mode === "mixed";
+    }
+
+    d.paragraphs = rows.map((row) => ({
+      text: cleanText(row.text),
+      align: (row.align ?? 0) as 0 | 1 | 2,
+      indentEm: row.indentEm ?? 0,
+      runs: row.runs?.map((r) => {
+        const runStyle = r.style ? { ...r.style } : undefined;
+        if (useHighlights) {
+          if (runStyle && (runStyle.roleId === 1 || runStyle.printed)) {
+            if (runStyle.fontFamily) {
+              const matched = matchSystemFont(runStyle.fontFamily);
+              if (matched) {
+                runStyle.fontPath = matched.path;
+              }
+            }
+          }
+        } else {
+          if (runStyle) {
+            runStyle.roleId = 0;
+            runStyle.printed = false;
+            runStyle.fontPath = undefined;
+            runStyle.highlight = undefined;
+          }
+        }
+        return {
+          text: cleanText(r.text),
+          style: runStyle,
+        };
+      }),
     }));
     d.text = d.paragraphs.map((r) => r.text).join("\n");
     d.align = d.paragraphs[0]?.align ?? 0;
@@ -714,6 +2340,8 @@ export function updateRegionGeometry(index: number, rect: [number, number, numbe
 
 export function cancelRegionEdit(): void {
   store.editingIndex = -1;
+  store.selectedRegionIndex = -1;
+  store.highlightIndex = -1;
 }
 
 /** 列表点击：跳到该页并进入调整态。 */
@@ -726,6 +2354,15 @@ export function jumpToRegion(index: number): void {
   }
   store.selectedRegionIndex = index;
   store.editingIndex = index;
+}
+
+/** 列表「🔍」：跳到该区域所在页、选中，并请求预览居中放大到该区域。 */
+export function focusRegion(index: number): void {
+  const r = store.regions[index];
+  if (!r) return;
+  jumpToRegion(index);
+  store.previewFocusIndex = index;
+  store.previewFocusToken += 1;
 }
 
 export function deleteSelectedRegion(): void {
@@ -744,3 +2381,173 @@ export function clearRegions(): void {
   store.selectedRegionIndex = -1;
   scheduleRender();
 }
+
+// ---------------------------------------------------------------- 关于与更新
+
+export function openAboutModal(): void {
+  store.aboutModalOpen = true;
+}
+
+export function closeAboutModal(): void {
+  store.aboutModalOpen = false;
+}
+
+export function openHelpModal(tab = "quickstart"): void {
+  store.helpTab = tab;
+  store.helpModalOpen = true;
+}
+
+export function closeHelpModal(): void {
+  store.helpModalOpen = false;
+}
+
+export function openUpdateModal(info?: UpdateInfo): void {
+  if (info) store.updateInfo = info;
+  store.updateModalOpen = true;
+}
+
+export function closeUpdateModal(skip = false): void {
+  store.updateModalOpen = false;
+  if (skip && store.updateInfo?.version) {
+    setSkippedVersion(store.updateInfo.version);
+  }
+}
+
+export function setAutoCheckUpdate(enabled: boolean): void {
+  store.autoCheckUpdate = enabled;
+  try {
+    localStorage.setItem(KEY_AUTO_CHECK, String(enabled));
+  } catch {}
+}
+
+export function setSkippedVersion(version: string): void {
+  store.skippedVersion = version;
+  try {
+    localStorage.setItem(KEY_SKIPPED_VERSION, version);
+  } catch {}
+}
+
+export async function openExternalUrl(url: string): Promise<void> {
+  if (!url) return;
+  try {
+    await api.openUrl(url);
+  } catch (e) {
+    console.error("打开浏览器失败:", e);
+    // fallback window.open
+    window.open(url, "_blank");
+  }
+}
+
+/** 手动触发检查更新（在关于对话框中） */
+export async function manualCheckUpdate(): Promise<void> {
+  if (store.checkingUpdate) return;
+  store.checkingUpdate = true;
+  store.updateStatusText = "正在连接 GitHub 查询最新版本…";
+
+  try {
+    const info = await api.checkForUpdates(APP_VERSION);
+    store.updateInfo = info;
+
+    if (info.hasUpdate) {
+      store.updateStatusText = `🎉 发现新版本：v${info.version}`;
+      openUpdateModal(info);
+    } else {
+      store.updateStatusText = `✅ 当前已是最新版本 (v${APP_VERSION})`;
+      appMessage.success(`当前已是最新版本 (v${APP_VERSION})，无需更新。`);
+    }
+  } catch (e) {
+    store.updateStatusText = "❌ 查询失败，请检查网络连接";
+    appDialog.warning({
+      title: "检查更新失败",
+      content: `无法连接至 GitHub Releases API：${e}\n请检查网络连接或稍后重试。`,
+      positiveText: "知道了",
+    });
+  } finally {
+    store.checkingUpdate = false;
+  }
+}
+
+/** 软件启动时静默检查更新（本次会话只跑一次，避免首启补检与正常启动重复） */
+let startupUpdateChecked = false;
+export async function startupCheckUpdate(): Promise<void> {
+  if (!store.autoCheckUpdate || startupUpdateChecked) return;
+  startupUpdateChecked = true;
+
+  try {
+    const info = await api.checkForUpdates(APP_VERSION);
+    store.updateInfo = info;
+
+    if (info.hasUpdate) {
+      // 若用户未跳过此版本，则主动弹出更新提示
+      if (info.version !== store.skippedVersion) {
+        openUpdateModal(info);
+      }
+    }
+  } catch (e) {
+    // 启动静默检查失败时不打扰用户
+    console.warn("启动检查更新失败:", e);
+  }
+}
+
+// ---------------------------------------------------------------- 角色管理
+
+export function addRole(name?: string, printed = false, highlight?: string | null): UiHandwritingRole {
+  const maxId = store.roles.reduce((m, r) => Math.max(m, r.id), -1);
+  const nextId = Math.max(maxId + 1, 2);
+  const hlInfo = getHighlightInfo(highlight);
+  const hlLabel = hlInfo ? ` (${hlInfo.name})` : "";
+  const newRole: UiHandwritingRole = {
+    id: nextId,
+    name: name || (printed ? `打印角色 ${nextId}` : `手写角色 ${nextId - 1}${hlLabel}`),
+    fontPath: "",
+    printed,
+    highlight: highlight ?? null,
+    fill: null,
+  };
+  store.roles.push(newRole);
+  scheduleRender();
+  return newRole;
+}
+
+export function deleteRole(id: number): void {
+  const idx = store.roles.findIndex((r) => r.id === id);
+  if (idx >= 0) {
+    store.roles.splice(idx, 1);
+    scheduleRender();
+  }
+}
+
+export async function chooseRoleFont(id: number): Promise<void> {
+  const role = store.roles.find((r) => r.id === id);
+  if (!role) return;
+  const p = await dialogs.pickFont();
+  if (typeof p === "string") {
+    role.fontPath = p;
+    scheduleRender();
+  }
+}
+
+export function resetRoles(): void {
+  store.roles = defaultRoles();
+  scheduleRender();
+}
+
+export function roleHasOverrides(r: UiHandwritingRole): boolean {
+  return (
+    r.fontSize != null ||
+    r.fill != null ||
+    (r.highlight != null && r.highlight !== "") ||
+    r.wordSpacing != null ||
+    r.lineSpacing != null ||
+    r.fontSizeSigma != null ||
+    r.wordSpacingSigma != null ||
+    r.lineSpacingSigma != null ||
+    r.perturbXSigma != null ||
+    r.perturbYSigma != null ||
+    r.perturbThetaSigma != null ||
+    r.miswriteRate != null ||
+    r.miswriteStrikeoutStyleIndex != null
+  );
+}
+
+

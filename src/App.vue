@@ -1,21 +1,47 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, watch } from "vue";
-import { NConfigProvider, NMessageProvider } from "naive-ui";
+import { darkTheme, NButton, NConfigProvider, NDialogProvider, NMessageProvider, NPopselect } from "naive-ui";
 import type { GlobalThemeOverrides } from "naive-ui";
 import PreviewPane from "./components/PreviewPane.vue";
 import ParamsPanel from "./components/ParamsPanel.vue";
+import AboutModal from "./components/AboutModal.vue";
+import HelpModal from "./components/HelpModal.vue";
+import UpdateModal from "./components/UpdateModal.vue";
+import FirstRunModal from "./components/FirstRunModal.vue";
 import {
+  APP_VERSION,
   buildParams,
   cancelRegionEdit,
+  cycleThemePreference,
   doRender,
+  ensureUsableBackground,
+  ensureUsableFont,
+  ensureStarterLayout,
+  initSystemFonts,
+  initThemeSystem,
+  isDarkActive,
   loadBgDimensions,
+  maybeOpenOnboarding,
+  openAboutModal,
+  openHelpModal,
+  openOnboarding,
   refreshPresets,
   scheduleRender,
+  setThemePreference,
+  startupCheckUpdate,
   store,
 } from "./store";
+import type { ThemePreference } from "./store";
 
-// 主题：延续原版的青绿主色调，按 Web 标准重制
-const themeOverrides: GlobalThemeOverrides = {
+// 状态栏主题按钮的 Popselect 选项（自动 / 浅色 / 深色）
+const themeOptions = [
+  { label: "🖥️ 自动跟随系统", value: "auto" },
+  { label: "☀️ 浅色模式", value: "light" },
+  { label: "🌙 深色模式", value: "dark" },
+];
+
+// 浅色主题：国风青绿主色调
+const lightThemeOverrides: GlobalThemeOverrides = {
   common: {
     primaryColor: "#2e7d74",
     primaryColorHover: "#3d948a",
@@ -26,6 +52,52 @@ const themeOverrides: GlobalThemeOverrides = {
   },
 };
 
+// 深色主题：对齐 Python 原版墨绿暗色调
+const darkThemeOverrides: GlobalThemeOverrides = {
+  common: {
+    primaryColor: "#5ea84d",
+    primaryColorHover: "#72c761",
+    primaryColorPressed: "#438536",
+    primaryColorSuppl: "#5ea84d",
+    bodyColor: "#181c19",
+    cardColor: "#232b26",
+    modalColor: "#232b26",
+    popoverColor: "#232b26",
+    tableColor: "#232b26",
+    inputColor: "#232b26",
+    borderColor: "#38453d",
+    textColorBase: "#e8f0eb",
+    textColor1: "#e8f0eb",
+    textColor2: "#dce5df",
+    textColor3: "#8e9e95",
+    borderRadius: "6px",
+    fontSize: "13px",
+  },
+  Card: {
+    color: "#232b26",
+    borderColor: "#38453d",
+    textColor: "#e8f0eb",
+  },
+  Modal: {
+    color: "#232b26",
+    textColor: "#e8f0eb",
+  },
+  Input: {
+    color: "#232b26",
+    colorFocus: "#232b26",
+    border: "1px solid #38453d",
+    borderFocus: "1px solid #5ea84d",
+    textColor: "#e8f0eb",
+    placeholderColor: "#6c7d74",
+  },
+};
+
+const activeTheme = computed(() => (isDarkActive() ? darkTheme : null));
+const activeOverrides = computed(() =>
+  isDarkActive() ? darkThemeOverrides : lightThemeOverrides
+);
+
+
 // 自动预览：任意参数/段落/区域变化后防抖 300ms 渲染（对齐 README 承诺的行为）
 const paramSnapshot = computed(() => JSON.stringify(buildParams()));
 watch(paramSnapshot, () => {
@@ -33,14 +105,25 @@ watch(paramSnapshot, () => {
   scheduleRender();
 });
 
-onMounted(() => {
-  void refreshPresets();
+onMounted(async () => {
+  initThemeSystem();
+  await initSystemFonts();
+  // 冷启动兜底：没选字体/纸张时自动挑系统楷体和内置纸张，避免首屏直接报错
+  await ensureUsableFont();
+  await refreshPresets();
+  await ensureUsableBackground();
+  await ensureStarterLayout();
   loadBgDimensions(store.backgroundPath);
+  maybeOpenOnboarding();
+  // 首次引导打开时不叠加更新弹窗，避免首屏两个模态框打架
+  if (!store.onboardingOpen) void startupCheckUpdate();
+  await doRender();
 });
+
 
 // Esc：退出区域调整态（正在输入框/编辑器里打字时不劫持）
 function onKeydown(e: KeyboardEvent): void {
-  if (e.key !== "Escape" || store.editingIndex < 0) return;
+  if (e.key !== "Escape" || (store.editingIndex < 0 && store.selectedRegionIndex < 0)) return;
   const el = e.target as HTMLElement | null;
   if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) {
     return;
@@ -50,23 +133,57 @@ function onKeydown(e: KeyboardEvent): void {
 }
 window.addEventListener("keydown", onKeydown);
 onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
-
-// 启动即尝试一次渲染（无字体/背景时后端返回可读错误，显示在状态栏）
-void doRender();
 </script>
 
 <template>
-  <NConfigProvider :theme-overrides="themeOverrides" abstract>
-    <NMessageProvider>
-      <div class="app-shell">
-        <div class="app-main">
-          <PreviewPane />
-          <ParamsPanel />
+  <NConfigProvider :theme="activeTheme" :theme-overrides="activeOverrides" abstract>
+    <NDialogProvider>
+
+      <NMessageProvider>
+        <div class="app-shell">
+          <div class="app-main">
+            <PreviewPane />
+            <ParamsPanel />
+          </div>
+          <footer class="status-bar">
+            <span class="status-text">{{ store.status }}</span>
+            <div class="status-actions">
+              <NPopselect
+                :value="store.themePreference"
+                :options="themeOptions"
+                @update:value="(val: ThemePreference) => setThemePreference(val)"
+                trigger="hover"
+              >
+                <NButton size="tiny" quaternary class="status-theme-btn" @click="cycleThemePreference()">
+                  <template v-if="store.themePreference === 'auto'">
+                    🖥️ 自动 ({{ isDarkActive() ? '深色' : '浅色' }})
+                  </template>
+                  <template v-else-if="store.themePreference === 'dark'">🌙 深色</template>
+                  <template v-else>☀️ 浅色</template>
+                </NButton>
+              </NPopselect>
+              <span class="status-sep">·</span>
+              <span class="status-link" @click="openOnboarding()" title="重新查看新手引导">
+                ✨ 新手引导
+              </span>
+              <span class="status-sep">·</span>
+              <span class="status-link" @click="openHelpModal()" title="查看软件使用教程与技巧">
+                📖 使用教程
+              </span>
+              <span class="status-sep">·</span>
+              <span class="status-link" @click="openAboutModal()" title="查看软件版本与开源项目">
+                v{{ APP_VERSION }} · 关于与更新
+              </span>
+            </div>
+          </footer>
         </div>
-        <footer class="status-bar">
-          <span class="status-text">{{ store.status }}</span>
-        </footer>
-      </div>
-    </NMessageProvider>
+
+        <HelpModal />
+        <AboutModal />
+        <UpdateModal />
+        <FirstRunModal />
+      </NMessageProvider>
+    </NDialogProvider>
   </NConfigProvider>
 </template>
+
